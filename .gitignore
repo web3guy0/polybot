@@ -10,7 +10,7 @@ data/
 *.sqlite3
 
 # Binaries
-polybot
+
 polybot.exe
 /bin/
 /dist/
