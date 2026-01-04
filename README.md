@@ -1,55 +1,76 @@
 # 🤖 Polybot
 
-**Polymarket Arbitrage Alert Bot** - A professional-grade Go application that monitors Polymarket for arbitrage opportunities and sends real-time Telegram alerts.
+**Crypto Prediction Trading Bot for Polymarket** - A Go application that uses technical analysis to predict cryptocurrency price movements and trade Polymarket prediction windows.
 
 ![Go Version](https://img.shields.io/badge/Go-1.21+-00ADD8?style=flat&logo=go)
 ![License](https://img.shields.io/badge/License-MIT-green)
 
 ## 🚀 Features
 
-- **Real-time Monitoring** - Scans Polymarket every 30 seconds (configurable)
-- **Instant Alerts** - Telegram notifications with actionable insights
-- **Smart Detection** - Identifies underpriced and overpriced markets
-- **Modern Bot** - Interactive Telegram bot with inline keyboards
-- **Professional Architecture** - Clean, modular codebase ready for expansion
-- **Future-Ready** - Trading engine stub for auto-trading capabilities
+- **6 Technical Indicators** - RSI, Momentum, Volume, Order Book, Funding Rate, Buy/Sell Ratio
+- **Real-time Signals** - Generates UP/DOWN/NO_TRADE predictions with confidence scores
+- **Risk Management** - Position sizing, daily limits, one-position-per-window enforcement
+- **Telegram Bot** - Interactive alerts and manual/auto trading
+- **Config-driven** - Change trading asset via environment variable
+- **Clean Architecture** - Strategy → Risk → Trade pipeline
 
-## 📊 How Arbitrage Works
+## 📊 How It Works
 
-On Polymarket, each market has YES and NO tokens. In a perfectly efficient market:
-```
-YES price + NO price = $1.00
-```
+Polymarket offers prediction windows like "Will BTC go up in the next 15 minutes?"
 
-When this doesn't hold true, there's an arbitrage opportunity:
+This bot:
+1. **Analyzes** real-time market data from Binance
+2. **Generates** directional signals using 6 technical indicators
+3. **Validates** signals through risk management (confidence, daily limits, etc.)
+4. **Executes** trades on Polymarket (manual or automatic)
 
-| Situation | Total | Opportunity |
-|-----------|-------|-------------|
-| YES: $0.48 + NO: $0.49 | $0.97 | Buy both for guaranteed 3% profit |
-| YES: $0.52 + NO: $0.51 | $1.03 | Overpriced - wait or short |
+### Signal Generation
+
+| Indicator | Weight | What It Measures |
+|-----------|--------|------------------|
+| RSI | 20% | Overbought/oversold conditions |
+| Momentum | 25% | Price trend strength |
+| Volume | 15% | Trading activity relative to average |
+| Order Book | 20% | Buy/sell pressure imbalance |
+| Funding Rate | 10% | Market sentiment (longs vs shorts) |
+| Buy/Sell Ratio | 10% | Taker buy vs sell activity |
+
+**Signal Strength:**
+- Score > 70 = STRONG (trade signal)
+- Score 40-70 = MODERATE  
+- Score < 40 = WEAK (no trade)
 
 ## 🏗️ Architecture
 
 ```
 polybot/
-├── cmd/
-│   └── polybot/
-│       └── main.go          # Application entrypoint
+├── cmd/polybot/main.go       # Application entrypoint
 ├── internal/
-│   ├── bot/
-│   │   └── telegram.go      # Telegram bot & commands
-│   ├── config/
-│   │   └── config.go        # Configuration management
-│   ├── database/
-│   │   └── database.go      # SQLite persistence
-│   ├── polymarket/
-│   │   └── client.go        # Polymarket API client
-│   ├── scanner/
-│   │   └── scanner.go       # Opportunity scanner
-│   └── trading/
-│       └── engine.go        # Trading engine (future)
-├── .env.example             # Configuration template
-├── go.mod                   # Go modules
+│   ├── strategy/             # Trading strategies
+│   │   ├── strategy.go       # Strategy interface & Signal types
+│   │   └── crypto_15m.go     # 15-minute crypto strategy
+│   ├── risk/                 # Risk management
+│   │   └── manager.go        # Position sizing, daily limits
+│   ├── markets/              # Market orchestration
+│   │   └── manager.go        # Config-driven market handling
+│   ├── predictor/            # Signal generation (READ-ONLY)
+│   │   └── predictor.go      # Technical indicator analysis
+│   ├── indicators/           # Technical indicators
+│   │   └── indicators.go     # RSI, Momentum, etc.
+│   ├── trading/              # Trade execution
+│   │   ├── engine.go         # Order execution
+│   │   └── btc_trader.go     # Polymarket trading
+│   ├── datafeed/             # Data sources
+│   │   └── binance.go        # Binance WebSocket feed
+│   ├── binance/              # Binance client
+│   ├── polymarket/           # Polymarket integration
+│   │   ├── client.go         # API client
+│   │   └── btc_scanner.go    # Window scanner
+│   ├── bot/                  # Telegram bot
+│   │   └── telegram.go       # Commands & alerts
+│   ├── config/               # Configuration
+│   └── database/             # SQLite persistence
+├── .env.example              # Configuration template
 └── README.md
 ```
 
@@ -63,38 +84,26 @@ polybot/
 
 ### Installation
 
-1. **Clone the repository**
-   ```bash
-   git clone https://github.com/yourusername/polybot.git
-   cd polybot
-   ```
+```bash
+# Clone repository
+git clone https://github.com/web3guy0/polybot.git
+cd polybot
 
-2. **Copy environment file**
-   ```bash
-   cp .env.example .env
-   ```
+# Copy environment file
+cp .env.example .env
 
-3. **Configure your settings**
-   ```bash
-   # Edit .env with your values
-   TELEGRAM_BOT_TOKEN=your_token_here
-   TELEGRAM_CHAT_ID=your_chat_id
-   ```
+# Edit .env with your values
+nano .env
 
-4. **Install dependencies**
-   ```bash
-   go mod tidy
-   ```
+# Install dependencies
+go mod tidy
 
-5. **Build**
-   ```bash
-   go build -o polybot ./cmd/polybot
-   ```
+# Build
+go build -o polybot ./cmd/polybot
 
-6. **Run**
-   ```bash
-   ./polybot
-   ```
+# Run
+./polybot
+```
 
 ## 📱 Telegram Commands
 
@@ -102,39 +111,70 @@ polybot/
 |---------|-------------|
 | `/start` | Initialize bot & subscribe to alerts |
 | `/help` | Show all commands |
+| `/signal` | Get current prediction signal |
+| `/windows` | View active prediction windows |
 | `/status` | Bot & market status |
-| `/opportunities` | Current arbitrage opportunities |
-| `/stats` | Statistics & P/L tracking |
-| `/settings` | Customize alert preferences |
-| `/subscribe` | Enable alerts |
-| `/unsubscribe` | Disable alerts |
+| `/trade UP/DOWN` | Execute manual trade |
+| `/autotrade on/off` | Toggle automatic trading |
+| `/stats` | Trading statistics |
+| `/settings` | View/change settings |
+| `/subscribe` | Enable signal alerts |
+| `/unsubscribe` | Disable signal alerts |
 
 ## ⚙️ Configuration
 
+### Core Settings
+
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `TELEGRAM_BOT_TOKEN` | - | Your Telegram bot token |
-| `TELEGRAM_CHAT_ID` | - | Your Telegram chat ID |
-| `SCAN_INTERVAL` | `30s` | How often to scan markets |
-| `MIN_SPREAD_PCT` | `2` | Minimum spread % for alerts |
-| `ALERT_COOLDOWN` | `5m` | Cooldown between repeat alerts |
-| `MAX_MARKETS` | `0` | Max number of markets to scan (0 = unlimited) |
-| `POLYMARKET_BATCH_SIZE` | `1000` | Polymarket API batch size per request |
-| `POLYMARKET_MAX_RPS` | `5` | Max Polymarket API requests per second |
-| `TRADING_ENABLED` | `false` | Enable auto-trading |
-| `DRY_RUN` | `true` | Simulate trades without executing |
+| `TRADING_ASSET` | `BTC` | Asset to trade (BTC, ETH, SOL) |
+| `BTC_ENABLED` | `true` | Enable prediction system |
+| `BTC_AUTO_TRADE` | `false` | Enable automatic trading |
+| `BTC_ALERT_ONLY` | `true` | Only send alerts, don't trade |
 
-## 🔮 Roadmap
+### Risk Management
 
-- [x] Polymarket API integration
-- [x] Telegram bot with commands
-- [x] Opportunity detection
-- [x] SQLite persistence
-- [ ] Auto-trading integration
-- [ ] Multi-platform support (Kalshi, etc.)
-- [ ] Web dashboard
-- [ ] Position management
-- [ ] Risk management
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `BANKROLL` | `100` | Total trading bankroll |
+| `RISK_MAX_BET_SIZE` | `10` | Maximum bet per trade |
+| `RISK_MAX_DAILY_LOSS` | `50` | Stop trading after this loss |
+| `RISK_MAX_DAILY_TRADES` | `20` | Maximum trades per day |
+| `RISK_MIN_CONFIDENCE` | `0.60` | Minimum signal confidence |
+| `RISK_CHOP_FILTER` | `true` | Skip weak/choppy signals |
+
+### Signal Settings
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `BTC_MIN_SIGNAL_SCORE` | `25` | Minimum score for trade |
+| `BTC_MIN_CONFIDENCE` | `25` | Minimum confidence % |
+| `BTC_MIN_ODDS` | `0.35` | Minimum acceptable odds |
+| `BTC_MAX_ODDS` | `0.65` | Maximum acceptable odds |
+
+## 🔧 Development
+
+```bash
+# Run tests
+go test ./...
+
+# Run with debug logging
+DEBUG=true ./polybot
+
+# Build for production
+CGO_ENABLED=1 go build -ldflags="-s -w" -o polybot ./cmd/polybot
+```
+
+## 📈 Signal Flow
+
+```
+┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ┌─────────────┐
+│   Binance   │───▶│  Strategy   │───▶│    Risk     │───▶│   Trade     │
+│  WebSocket  │    │  Evaluate   │    │   Manager   │    │  Execute    │
+└─────────────┘    └─────────────┘    └─────────────┘    └─────────────┘
+     Data              Signal          Validation         Execution
+                    (UP/DOWN/NO)      (Size/Limits)      (Polymarket)
+```
 
 ## ⚠️ Disclaimer
 
@@ -146,4 +186,4 @@ MIT License - feel free to use and modify.
 
 ---
 
-Built with 💜 for the degen community
+Built with 💜 by [@web3guy0](https://github.com/web3guy0)

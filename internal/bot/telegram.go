@@ -1,30 +1,43 @@
+// Package bot provides Telegram bot functionality
+//
+// telegram.go - Telegram bot for crypto prediction alerts and trading
+// Monitors Polymarket prediction windows and sends alerts based on technical signals.
 package bot
 
 import (
 	"fmt"
 	"strings"
-	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/rs/zerolog/log"
 	"github.com/shopspring/decimal"
 
+	"github.com/web3guy0/polybot/internal/binance"
 	"github.com/web3guy0/polybot/internal/config"
 	"github.com/web3guy0/polybot/internal/database"
-	"github.com/web3guy0/polybot/internal/scanner"
+	"github.com/web3guy0/polybot/internal/polymarket"
+	"github.com/web3guy0/polybot/internal/predictor"
 	"github.com/web3guy0/polybot/internal/trading"
 )
 
+// Bot handles Telegram interactions for the prediction system
 type Bot struct {
-	api           *tgbotapi.BotAPI
-	cfg           *config.Config
-	db            *database.Database
-	scanner       *scanner.Scanner
-	tradingEngine *trading.Engine
-	stopCh        chan struct{}
+	api              *tgbotapi.BotAPI
+	cfg              *config.Config
+	db               *database.Database
+	tradingEngine    *trading.Engine
+	binanceClient    *binance.Client
+	predictor        *predictor.Predictor
+	windowScanner    *polymarket.BTCWindowScanner
+	trader           *trading.BTCTrader
+	stopCh           chan struct{}
 }
 
-func New(cfg *config.Config, db *database.Database, scanner *scanner.Scanner, engine *trading.Engine) (*Bot, error) {
+// New creates a new prediction-focused Telegram bot
+func New(cfg *config.Config, db *database.Database, engine *trading.Engine,
+	binanceClient *binance.Client, pred *predictor.Predictor, 
+	windowScanner *polymarket.BTCWindowScanner, trader *trading.BTCTrader) (*Bot, error) {
+	
 	api, err := tgbotapi.NewBotAPI(cfg.TelegramToken)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create Telegram bot: %w", err)
@@ -32,62 +45,56 @@ func New(cfg *config.Config, db *database.Database, scanner *scanner.Scanner, en
 
 	log.Info().Str("username", api.Self.UserName).Msg("🤖 Telegram bot connected")
 
-	return &Bot{
+	bot := &Bot{
 		api:           api,
 		cfg:           cfg,
 		db:            db,
-		scanner:       scanner,
 		tradingEngine: engine,
+		binanceClient: binanceClient,
+		predictor:     pred,
+		windowScanner: windowScanner,
+		trader:        trader,
 		stopCh:        make(chan struct{}),
-	}, nil
+	}
+
+	// Set up signal callback for alerts
+	if pred != nil && cfg.TelegramChatID != 0 {
+		pred.SetSignalCallback(func(signal predictor.Signal) {
+			strength := "WEAK"
+			absScore := absFloat(signal.TotalScore)
+			if absScore >= 70 {
+				strength = "STRONG"
+			} else if absScore >= 40 {
+				strength = "MODERATE"
+			}
+			if strength == "STRONG" || (cfg.BTCAlertOnly && strength != "WEAK") {
+				bot.sendSignalAlert(cfg.TelegramChatID, signal)
+			}
+		})
+	}
+
+	// Set up trade callback
+	if trader != nil && cfg.TelegramChatID != 0 {
+		trader.SetTradeCallback(func(trade trading.BTCTrade) {
+			bot.sendTradeAlert(cfg.TelegramChatID, trade)
+		})
+	}
+
+	return bot, nil
 }
 
+// Start begins the bot's command listener
 func (b *Bot) Start() {
-	// Subscribe to scanner opportunities
-	oppCh := b.scanner.Subscribe()
-
-	// Start listening for opportunities
-	go b.listenForOpportunities(oppCh)
-
-	// Start listening for commands
 	go b.listenForCommands()
 
-	// Send startup message if chat ID configured
 	if b.cfg.TelegramChatID != 0 {
 		b.sendStartupMessage()
 	}
 }
 
+// Stop stops the bot
 func (b *Bot) Stop() {
 	close(b.stopCh)
-}
-
-func (b *Bot) listenForOpportunities(ch chan scanner.Opportunity) {
-	alertTimes := make(map[string]time.Time)
-
-	for {
-		select {
-		case opp := <-ch:
-			// Check cooldown
-			if lastAlert, ok := alertTimes[opp.Market.ID]; ok {
-				if time.Since(lastAlert) < b.cfg.AlertCooldown {
-					continue
-				}
-			}
-
-			// Send alert
-			if b.cfg.TelegramChatID != 0 {
-				if err := b.sendOpportunityAlert(b.cfg.TelegramChatID, opp); err != nil {
-					log.Error().Err(err).Msg("Failed to send alert")
-				} else {
-					alertTimes[opp.Market.ID] = time.Now()
-				}
-			}
-
-		case <-b.stopCh:
-			return
-		}
-	}
 }
 
 func (b *Bot) listenForCommands() {
@@ -120,7 +127,6 @@ func (b *Bot) handleMessage(msg *tgbotapi.Message) {
 		Str("text", text).
 		Msg("Received message")
 
-	// Handle commands
 	if msg.IsCommand() {
 		switch msg.Command() {
 		case "start":
@@ -129,10 +135,16 @@ func (b *Bot) handleMessage(msg *tgbotapi.Message) {
 			b.cmdHelp(chatID)
 		case "status":
 			b.cmdStatus(chatID)
-		case "opportunities", "opps":
-			b.cmdOpportunities(chatID)
+		case "signal":
+			b.cmdSignal(chatID)
+		case "windows":
+			b.cmdWindows(chatID)
+		case "trade":
+			b.cmdTrade(chatID, msg.CommandArguments())
 		case "stats":
 			b.cmdStats(chatID)
+		case "autotrade":
+			b.cmdAutoTrade(chatID, msg.CommandArguments())
 		case "settings":
 			b.cmdSettings(chatID)
 		case "subscribe":
@@ -154,210 +166,382 @@ func (b *Bot) handleCallback(cb *tgbotapi.CallbackQuery) {
 		Str("data", data).
 		Msg("Received callback")
 
-	// Acknowledge callback
 	b.api.Request(tgbotapi.NewCallback(cb.ID, ""))
 
 	switch {
-	case data == "refresh_opps":
-		b.cmdOpportunities(chatID)
+	case data == "refresh_signal":
+		b.cmdSignal(chatID)
+	case data == "refresh_windows":
+		b.cmdWindows(chatID)
 	case data == "refresh_stats":
 		b.cmdStats(chatID)
+	case data == "show_windows":
+		b.cmdWindows(chatID)
+	case data == "trade_up":
+		b.cmdTrade(chatID, "UP")
+	case data == "trade_down":
+		b.cmdTrade(chatID, "DOWN")
 	case data == "toggle_alerts":
 		b.toggleAlerts(chatID)
-	case strings.HasPrefix(data, "set_spread_"):
-		spread := strings.TrimPrefix(data, "set_spread_")
-		b.setMinSpread(chatID, spread)
 	}
 }
 
 // Commands
 
 func (b *Bot) cmdStart(chatID int64) {
-	// Save user settings
 	settings, _ := b.db.GetUserSettings(chatID)
 	settings.ChatID = chatID
 	settings.AlertsEnabled = true
 	b.db.SaveUserSettings(settings)
 
-	text := `🚀 *Welcome to Polybot!*
+	asset := b.cfg.TradingAsset
+	if asset == "" {
+		asset = "BTC"
+	}
 
-Your Polymarket Arbitrage Alert Bot
+	text := fmt.Sprintf(`🚀 *Welcome to Polybot!*
+
+Your %s Prediction Trading Bot
 
 *What I do:*
-• 📊 Monitor Polymarket 24/7
-• 🔍 Find arbitrage opportunities
-• 📱 Send instant alerts
-• 💰 Help you profit from mispricings
+• 📊 Analyze %s using 6 technical indicators
+• 🎯 Generate buy/sell signals for Polymarket windows
+• 📱 Send instant alerts on strong signals
+• 💰 Execute trades automatically (optional)
+
+*How It Works:*
+Polymarket offers 15-minute prediction windows.
+I analyze RSI, Momentum, Volume, Order Book,
+Funding Rate & Buy/Sell Ratio to predict direction.
 
 *Quick Start:*
-1️⃣ You're now subscribed to alerts
-2️⃣ Use /settings to customize
-3️⃣ Use /opportunities to see current opps
+1️⃣ Use /signal to see current prediction
+2️⃣ Use /windows to view active markets
+3️⃣ Use /trade UP or /trade DOWN to execute
 
 *Commands:*
 /help - All commands
-/status - Bot status
-/opportunities - Current opportunities
-/stats - Your statistics
-/settings - Customize alerts
+/signal - Current prediction signal
+/windows - Active prediction windows
+/stats - Trading statistics
 
-Let's make some money! 💪`
+Let's trade! 💪`, asset, asset)
 
 	b.sendMarkdown(chatID, text)
 }
 
 func (b *Bot) cmdHelp(chatID int64) {
-	text := `📚 *Polybot Commands*
+	asset := b.cfg.TradingAsset
+	if asset == "" {
+		asset = "BTC"
+	}
 
-*Monitoring:*
+	text := fmt.Sprintf(`📚 *Polybot Commands*
+
+*📊 Prediction:*
+/signal - Get current %s prediction
+/windows - View active prediction windows
 /status - Bot & market status
-/opportunities - Current arb opportunities  
-/stats - Statistics & P/L
 
-*Settings:*
+*💰 Trading:*
+/trade UP - Bet on price going up
+/trade DOWN - Bet on price going down
+/autotrade on/off - Toggle auto-trading
+/stats - Trading statistics
+
+*⚙️ Settings:*
 /settings - View/change settings
-/subscribe - Enable alerts
-/unsubscribe - Disable alerts
+/subscribe - Enable signal alerts
+/unsubscribe - Disable signal alerts
 
-*How Arbitrage Works:*
-When YES + NO ≠ $1.00, there's an opportunity:
+*How Signals Work:*
+Bot uses 6 technical indicators:
+• RSI - Overbought/oversold
+• Momentum - Price trend strength
+• Volume - Trading activity
+• Order Book - Buy/sell pressure
+• Funding Rate - Market sentiment
+• Buy/Sell Ratio - Taker activity
 
-• Total < $1.00 → Buy both, guaranteed profit
-• Total > $1.00 → Prices inflated, wait or short
-
-*Example:*
-YES: $0.48 + NO: $0.49 = $0.97
-Buy $100 each = $97 cost
-One MUST win = $100 return
-*Profit: $3 (3%)*
-
-Need help? Join our community!`
+Strong signals (score > 70) = trade opportunity!`, asset)
 
 	b.sendMarkdown(chatID, text)
 }
 
 func (b *Bot) cmdStatus(chatID int64) {
-	opps := b.scanner.GetOpportunities()
-
 	settings, _ := b.db.GetUserSettings(chatID)
 	alertStatus := "🟢 Enabled"
 	if !settings.AlertsEnabled {
 		alertStatus = "🔴 Disabled"
 	}
 
+	autoTradeStatus := "🔴 OFF"
+	if b.cfg.BTCAutoTrade {
+		autoTradeStatus = "🟢 ON"
+	}
+
+	asset := b.cfg.TradingAsset
+	if asset == "" {
+		asset = "BTC"
+	}
+
+	windowCount := 0
+	if b.windowScanner != nil {
+		windowCount = len(b.windowScanner.GetActiveWindows())
+	}
+
 	text := fmt.Sprintf(`📊 *Bot Status*
 
 🤖 *Bot:* Online
-📡 *Scanner:* Active
-🔔 *Your Alerts:* %s
-⏱️ *Scan Interval:* %s
-📉 *Min Spread:* %s%%
+📡 *Asset:* %s
+🎯 *Auto-Trade:* %s
+🔔 *Alerts:* %s
 
-*Current Market:*
-• Active Opportunities: %d
-• Last Scan: Just now
+*Market:*
+• Active Windows: %d
+• Scan Interval: %s
 
-*Your Settings:*
-• Min Spread Alert: %s%%`,
+*Risk Settings:*
+• Max Bet: $%s
+• Min Odds: %s
+• Max Odds: %s`,
+		asset,
+		autoTradeStatus,
 		alertStatus,
-		b.cfg.ScanInterval,
-		b.cfg.MinSpreadPct.String(),
-		len(opps),
-		settings.MinSpreadPct.String(),
+		windowCount,
+		b.cfg.BTCCooldown.String(),
+		b.cfg.BTCMaxBetSize.String(),
+		b.cfg.BTCMinOdds.String(),
+		b.cfg.BTCMaxOdds.String(),
 	)
 
 	keyboard := tgbotapi.NewInlineKeyboardMarkup(
 		tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("🔄 Refresh", "refresh_opps"),
-			tgbotapi.NewInlineKeyboardButtonData("⚙️ Settings", "settings"),
+			tgbotapi.NewInlineKeyboardButtonData("🔄 Refresh", "refresh_signal"),
+			tgbotapi.NewInlineKeyboardButtonData("📊 Windows", "show_windows"),
 		),
 	)
 
 	b.sendMarkdownWithKeyboard(chatID, text, keyboard)
 }
 
-func (b *Bot) cmdOpportunities(chatID int64) {
-	opps := b.scanner.GetOpportunities()
-
-	if len(opps) == 0 {
-		text := `📊 *Current Opportunities*
-
-No arbitrage opportunities found right now.
-
-Markets are efficiently priced ✅
-
-_I'll alert you when opportunities appear!_`
-
-		keyboard := tgbotapi.NewInlineKeyboardMarkup(
-			tgbotapi.NewInlineKeyboardRow(
-				tgbotapi.NewInlineKeyboardButtonData("🔄 Refresh", "refresh_opps"),
-			),
-		)
-		b.sendMarkdownWithKeyboard(chatID, text, keyboard)
+func (b *Bot) cmdSignal(chatID int64) {
+	if b.predictor == nil || b.binanceClient == nil {
+		b.sendText(chatID, "❌ Prediction system not enabled. Set BTC_ENABLED=true in config.")
 		return
 	}
 
-	text := fmt.Sprintf("📊 *Current Opportunities* (%d found)\n\n", len(opps))
+	signal := b.predictor.GetCurrentSignal()
+	priceFloat, _ := signal.CurrentPrice.Float64()
 
-	for i, opp := range opps {
-		if i >= 5 {
-			text += fmt.Sprintf("\n_...and %d more_", len(opps)-5)
-			break
-		}
-
-		var emoji string
-		switch t := opp.Type; t {
-		case scanner.TypeOverpriced:
-			emoji = "🟡"
-		case scanner.TypeSevereMispricing:
-			emoji = "🔴"
-		default:
-			emoji = "🟢"
-		}
-
-		question := opp.Market.Question
-		if len(question) > 50 {
-			question = question[:50] + "..."
-		}
-
-		text += fmt.Sprintf(`%s *%s*
-   YES: $%s | NO: $%s | Spread: %s%%
-
-`, emoji, escapeMarkdown(question),
-			opp.YesPrice.StringFixed(3),
-			opp.NoPrice.StringFixed(3),
-			opp.SpreadPct.StringFixed(2))
+	var dirEmoji, dirText string
+	if signal.Direction == "UP" {
+		dirEmoji = "🟢"
+		dirText = "BULLISH"
+	} else if signal.Direction == "DOWN" {
+		dirEmoji = "🔴"
+		dirText = "BEARISH"
+	} else {
+		dirEmoji = "⚪"
+		dirText = "NEUTRAL"
 	}
+
+	strength := "WEAK"
+	absScore := absFloat(signal.TotalScore)
+	if absScore >= 70 {
+		strength = "STRONG 🔥"
+	} else if absScore >= 40 {
+		strength = "MODERATE"
+	}
+
+	asset := b.cfg.TradingAsset
+	if asset == "" {
+		asset = "BTC"
+	}
+
+	text := fmt.Sprintf(`🔶 *%s Prediction Signal*
+
+💰 *Price:* $%s
+
+%s *Direction:* %s
+📊 *Score:* %.0f/100
+💪 *Strength:* %s
+🎯 *Confidence:* %.0f%%
+
+*Indicator Breakdown:*
+├ RSI: %.0f
+├ Momentum: %.0f
+├ Volume: %.0f
+├ Order Book: %.0f
+├ Funding: %.0f
+└ Buy/Sell: %.0f
+
+⏱️ Updated: %s`,
+		asset,
+		formatPrice(priceFloat),
+		dirEmoji, dirText,
+		absScore,
+		strength,
+		signal.Confidence,
+		signal.RSI,
+		signal.Momentum,
+		signal.VolumeSignal,
+		signal.OrderBook,
+		signal.FundingRate,
+		signal.BuySellRatio,
+		signal.Timestamp.Format("15:04:05"),
+	)
 
 	keyboard := tgbotapi.NewInlineKeyboardMarkup(
 		tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("🔄 Refresh", "refresh_opps"),
+			tgbotapi.NewInlineKeyboardButtonData("🔄 Refresh", "refresh_signal"),
+			tgbotapi.NewInlineKeyboardButtonData("📊 Windows", "show_windows"),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("🟢 Trade UP", "trade_up"),
+			tgbotapi.NewInlineKeyboardButtonData("🔴 Trade DOWN", "trade_down"),
 		),
 	)
 
 	b.sendMarkdownWithKeyboard(chatID, text, keyboard)
 }
 
+func (b *Bot) cmdWindows(chatID int64) {
+	if b.windowScanner == nil {
+		b.sendText(chatID, "❌ Window scanner not enabled.")
+		return
+	}
+
+	windows := b.windowScanner.GetActiveWindows()
+	if len(windows) == 0 {
+		b.sendText(chatID, "📊 No active prediction windows found. Markets may be closed.")
+		return
+	}
+
+	asset := b.cfg.TradingAsset
+	if asset == "" {
+		asset = "BTC"
+	}
+
+	text := fmt.Sprintf("📊 *Active %s Windows* (%d)\n\n", asset, len(windows))
+
+	for i, w := range windows {
+		if i >= 5 {
+			text += fmt.Sprintf("\n_...and %d more_", len(windows)-5)
+			break
+		}
+
+		yesPrice, _ := w.YesPrice.Float64()
+		noPrice, _ := w.NoPrice.Float64()
+		volume, _ := w.Volume.Float64()
+
+		text += fmt.Sprintf(`*%s*
+├ UP: $%.3f | DOWN: $%.3f
+├ Volume: $%.0f
+└ Ends: %s
+
+`,
+			escapeMarkdown(w.Question),
+			yesPrice, noPrice,
+			volume,
+			w.EndDate.Format("15:04"),
+		)
+	}
+
+	keyboard := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("🔄 Refresh", "refresh_windows"),
+		),
+	)
+
+	b.sendMarkdownWithKeyboard(chatID, text, keyboard)
+}
+
+func (b *Bot) cmdTrade(chatID int64, args string) {
+	if b.trader == nil {
+		b.sendText(chatID, "❌ Trading not enabled.")
+		return
+	}
+
+	direction := strings.ToUpper(strings.TrimSpace(args))
+	if direction != "UP" && direction != "DOWN" {
+		b.sendText(chatID, "⚠️ Usage: /trade UP or /trade DOWN")
+		return
+	}
+
+	trade, err := b.trader.ManualTrade(direction, b.cfg.BTCMaxBetSize)
+	if err != nil {
+		b.sendText(chatID, fmt.Sprintf("❌ Trade failed: %s", err.Error()))
+		return
+	}
+
+	var emoji string
+	if direction == "UP" {
+		emoji = "🟢"
+	} else {
+		emoji = "🔴"
+	}
+
+	entryF, _ := trade.EntryPrice.Float64()
+	amountF, _ := trade.Amount.Float64()
+
+	text := fmt.Sprintf(`%s *Trade Executed*
+
+*Direction:* %s
+*Amount:* $%.2f
+*Price:* $%.3f
+*Market:* %s
+
+_Trade ID: %s_`,
+		emoji,
+		direction,
+		amountF,
+		entryF,
+		escapeMarkdown(trade.WindowID),
+		trade.ID,
+	)
+
+	b.sendMarkdown(chatID, text)
+}
+
 func (b *Bot) cmdStats(chatID int64) {
-	stats, _ := b.db.GetStats()
+	if b.trader == nil {
+		b.sendText(chatID, "❌ Trading not enabled.")
+		return
+	}
 
-	text := fmt.Sprintf(`📈 *Statistics*
+	total, won, lost, profitDec, winRate := b.trader.GetStats()
+	profit, _ := profitDec.Float64()
 
-*All Time:*
-• Opportunities Found: %v
-• Trades Executed: %v
-• Total P/L: $%v
+	var pnlEmoji string
+	if profit > 0 {
+		pnlEmoji = "🟢"
+	} else if profit < 0 {
+		pnlEmoji = "🔴"
+	} else {
+		pnlEmoji = "⚪"
+	}
 
-*Today:*
-• Scans: Active
-• Alerts Sent: Multiple
+	asset := b.cfg.TradingAsset
+	if asset == "" {
+		asset = "BTC"
+	}
+
+	text := fmt.Sprintf(`📈 *%s Trading Statistics*
 
 *Performance:*
-• Uptime: 99.9%%
-• Avg Response: <1s`,
-		stats["total_opportunities"],
-		stats["total_trades"],
-		stats["total_pnl"],
+%s Total P/L: $%.2f
+├ Win Rate: %.1f%%
+├ Total Trades: %d
+├ Wins: %d
+└ Losses: %d`,
+		asset,
+		pnlEmoji,
+		profit,
+		winRate*100,
+		total,
+		won,
+		lost,
 	)
 
 	keyboard := tgbotapi.NewInlineKeyboardMarkup(
@@ -367,6 +551,30 @@ func (b *Bot) cmdStats(chatID int64) {
 	)
 
 	b.sendMarkdownWithKeyboard(chatID, text, keyboard)
+}
+
+func (b *Bot) cmdAutoTrade(chatID int64, args string) {
+	if b.trader == nil {
+		b.sendText(chatID, "❌ Trading not enabled.")
+		return
+	}
+
+	arg := strings.ToLower(strings.TrimSpace(args))
+
+	switch arg {
+	case "on", "enable", "start":
+		b.cfg.BTCAutoTrade = true
+		b.sendText(chatID, "🟢 Auto-trading ENABLED. Bot will execute trades on strong signals.")
+	case "off", "disable", "stop":
+		b.cfg.BTCAutoTrade = false
+		b.sendText(chatID, "🔴 Auto-trading DISABLED. Use /trade to execute manually.")
+	default:
+		status := "OFF"
+		if b.cfg.BTCAutoTrade {
+			status = "ON"
+		}
+		b.sendText(chatID, fmt.Sprintf("⚙️ Auto-trading is currently %s\n\nUsage: /autotrade on or /autotrade off", status))
+	}
 }
 
 func (b *Bot) cmdSettings(chatID int64) {
@@ -381,23 +589,15 @@ func (b *Bot) cmdSettings(chatID int64) {
 
 	text := fmt.Sprintf(`⚙️ *Settings*
 
-*Alerts:* %s
-*Min Spread:* %s%%
+*Signal Alerts:* %s
 
-Choose minimum spread to receive alerts:`,
+Alerts are sent when strong signals are detected.`,
 		alertStatus,
-		settings.MinSpreadPct.String(),
 	)
 
 	keyboard := tgbotapi.NewInlineKeyboardMarkup(
 		tgbotapi.NewInlineKeyboardRow(
 			tgbotapi.NewInlineKeyboardButtonData(alertBtn, "toggle_alerts"),
-		),
-		tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("1%", "set_spread_1"),
-			tgbotapi.NewInlineKeyboardButtonData("2%", "set_spread_2"),
-			tgbotapi.NewInlineKeyboardButtonData("3%", "set_spread_3"),
-			tgbotapi.NewInlineKeyboardButtonData("5%", "set_spread_5"),
 		),
 	)
 
@@ -409,7 +609,7 @@ func (b *Bot) cmdSubscribe(chatID int64) {
 	settings.AlertsEnabled = true
 	b.db.SaveUserSettings(settings)
 
-	b.sendText(chatID, "🔔 Alerts enabled! You'll receive notifications for arbitrage opportunities.")
+	b.sendText(chatID, "🔔 Alerts enabled! You'll receive notifications for strong trading signals.")
 }
 
 func (b *Bot) cmdUnsubscribe(chatID int64) {
@@ -432,79 +632,110 @@ func (b *Bot) toggleAlerts(chatID int64) {
 	}
 }
 
-func (b *Bot) setMinSpread(chatID int64, spread string) {
-	settings, _ := b.db.GetUserSettings(chatID)
+// Alerts
 
-	if s, err := decimal.NewFromString(spread); err == nil {
-		settings.MinSpreadPct = s
-		b.db.SaveUserSettings(settings)
-		b.sendText(chatID, fmt.Sprintf("✅ Minimum spread set to %s%%", spread))
-	}
-}
-
-// Alert sending
-
-func (b *Bot) sendOpportunityAlert(chatID int64, opp scanner.Opportunity) error {
-	var (
-		emoji  string
-		action string
-	)
-	switch t := opp.Type; t {
-	case scanner.TypeOverpriced:
-		emoji = "🟡"
-		action = "Prices inflated - wait or short"
-	case scanner.TypeSevereMispricing:
-		emoji = "🔴"
-		action = "SEVERE mispricing detected!"
-	default:
+func (b *Bot) sendSignalAlert(chatID int64, signal predictor.Signal) error {
+	var emoji, dirText string
+	if signal.Direction == "UP" {
 		emoji = "🟢"
-		action = "BUY BOTH for guaranteed profit"
+		dirText = "BULLISH"
+	} else {
+		emoji = "🔴"
+		dirText = "BEARISH"
 	}
 
-	question := opp.Market.Question
-	if len(question) > 80 {
-		question = question[:80] + "..."
+	strength := "WEAK"
+	absScore := absFloat(signal.TotalScore)
+	if absScore >= 70 {
+		strength = "STRONG 🔥"
+	} else if absScore >= 40 {
+		strength = "MODERATE"
 	}
 
-	text := fmt.Sprintf(`%s *ARB ALERT*
+	asset := b.cfg.TradingAsset
+	if asset == "" {
+		asset = "BTC"
+	}
 
-📊 *%s*
+	text := fmt.Sprintf(`%s *%s SIGNAL ALERT*
 
-💰 *Prices:*
-├ YES: $%s
-├ NO: $%s
-└ Total: $%s
+*Direction:* %s
+*Score:* %.0f/100
+*Strength:* %s
+*Confidence:* %.0f%%
 
-📈 *Spread:* %s%%
-
-💡 *Action:* %s
-
-🔗 [Trade on Polymarket](https://polymarket.com/event/%s)`,
+_Timestamp: %s_`,
 		emoji,
-		escapeMarkdown(question),
-		opp.YesPrice.StringFixed(3),
-		opp.NoPrice.StringFixed(3),
-		opp.TotalPrice.StringFixed(3),
-		opp.SpreadPct.StringFixed(2),
-		action,
-		opp.Market.Slug,
+		asset,
+		dirText,
+		absScore,
+		strength,
+		signal.Confidence,
+		signal.Timestamp.Format("15:04:05"),
 	)
 
 	keyboard := tgbotapi.NewInlineKeyboardMarkup(
 		tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonURL("🔗 Open Market", fmt.Sprintf("https://polymarket.com/event/%s", opp.Market.Slug)),
+			tgbotapi.NewInlineKeyboardButtonData("🟢 Trade UP", "trade_up"),
+			tgbotapi.NewInlineKeyboardButtonData("🔴 Trade DOWN", "trade_down"),
 		),
 	)
 
 	return b.sendMarkdownWithKeyboard(chatID, text, keyboard)
 }
 
+func (b *Bot) sendTradeAlert(chatID int64, trade trading.BTCTrade) error {
+	var emoji string
+	if trade.Direction == "UP" {
+		emoji = "🟢"
+	} else {
+		emoji = "🔴"
+	}
+
+	profit, _ := trade.Profit.Float64()
+	amount, _ := trade.Amount.Float64()
+	entry, _ := trade.EntryPrice.Float64()
+
+	var resultText string
+	if trade.Status == "completed" || trade.Status == "won" || trade.Status == "lost" {
+		if profit > 0 {
+			resultText = fmt.Sprintf("✅ WIN: +$%.2f", profit)
+		} else {
+			resultText = fmt.Sprintf("❌ LOSS: -$%.2f", -profit)
+		}
+	} else {
+		resultText = "⏳ Pending resolution"
+	}
+
+	text := fmt.Sprintf(`%s *TRADE EXECUTED*
+
+*Direction:* %s
+*Amount:* $%.2f
+*Entry:* $%.3f
+*Result:* %s
+
+_ID: %s_`,
+		emoji,
+		trade.Direction,
+		amount,
+		entry,
+		resultText,
+		trade.ID,
+	)
+
+	return b.sendMarkdown(chatID, text)
+}
+
 func (b *Bot) sendStartupMessage() {
-	text := `🟢 *Polybot Online*
+	asset := b.cfg.TradingAsset
+	if asset == "" {
+		asset = "BTC"
+	}
 
-Bot restarted and scanning markets.
+	text := fmt.Sprintf(`🟢 *Polybot Online*
 
-Use /status to check current state.`
+%s prediction system active.
+Use /signal to check current prediction.`, asset)
 
 	b.sendMarkdown(b.cfg.TelegramChatID, text)
 }
@@ -543,4 +774,24 @@ func escapeMarkdown(s string) string {
 		"`", "\\`",
 	)
 	return replacer.Replace(s)
+}
+
+func formatPrice(price float64) string {
+	return fmt.Sprintf("%.2f", price)
+}
+
+func absFloat(n float64) float64 {
+	if n < 0 {
+		return -n
+	}
+	return n
+}
+
+// Legacy compatibility - these are needed for database types
+func (b *Bot) setMinSpread(chatID int64, spread string) {
+	settings, _ := b.db.GetUserSettings(chatID)
+	if s, err := decimal.NewFromString(spread); err == nil {
+		settings.MinSpreadPct = s
+		b.db.SaveUserSettings(settings)
+	}
 }

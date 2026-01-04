@@ -1,0 +1,38 @@
+.
+├── README.md
+├── cmd
+│   └── polybot
+│       └── main.go
+├── go.mod
+├── go.sum
+├── internal
+│   ├── binance
+│   │   └── client.go
+│   ├── bot
+│   │   └── telegram.go
+│   ├── config
+│   │   └── config.go
+│   ├── database
+│   │   └── database.go
+│   ├── datafeed
+│   │   └── binance.go
+│   ├── indicators
+│   │   └── indicators.go
+│   ├── markets
+│   │   └── manager.go
+│   ├── polymarket
+│   │   ├── btc_scanner.go
+│   │   └── client.go
+│   ├── predictor
+│   │   └── predictor.go
+│   ├── risk
+│   │   └── manager.go
+│   ├── strategy
+│   │   ├── crypto_15m.go
+│   │   └── strategy.go
+│   └── trading
+│       ├── btc_trader.go
+│       └── engine.go
+└── tree.txt
+
+16 directories, 20 files
