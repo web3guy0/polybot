@@ -26,6 +26,7 @@ import (
 	"github.com/web3guy0/polybot/internal/arbitrage"
 	"github.com/web3guy0/polybot/internal/binance"
 	"github.com/web3guy0/polybot/internal/bot"
+	"github.com/web3guy0/polybot/internal/chainlink"
 	"github.com/web3guy0/polybot/internal/config"
 	"github.com/web3guy0/polybot/internal/database"
 	"github.com/web3guy0/polybot/internal/polymarket"
@@ -84,7 +85,15 @@ func main() {
 	}
 	log.Info().Msg("📈 Binance WebSocket connected")
 
-	// 2. Window scanner - find active prediction windows
+	// 2. Chainlink client - BTC/USD price feed on Polygon (what Polymarket uses for resolution)
+	chainlinkClient := chainlink.NewClient()
+	if err := chainlinkClient.Start(); err != nil {
+		log.Warn().Err(err).Msg("⚠️ Failed to start Chainlink client - using Binance only")
+	} else {
+		log.Info().Msg("⛓️ Chainlink price feed connected (Polygon)")
+	}
+
+	// 3. Window scanner - find active prediction windows
 	windowScanner := polymarket.NewWindowScanner(cfg.PolymarketAPIURL, asset)
 	windowScanner.Start()
 	log.Info().Str("asset", asset).Msg("🔍 Window scanner started")
@@ -112,7 +121,7 @@ func main() {
 	}
 
 	// 4. Arbitrage engine - the money maker
-	arbEngine := arbitrage.NewEngine(cfg, binanceClient, windowScanner)
+	arbEngine := arbitrage.NewEngine(cfg, binanceClient, chainlinkClient, windowScanner)
 
 	// Connect CLOB client to engine for order execution
 	if clobClient != nil {
@@ -143,7 +152,11 @@ func main() {
 	log.Info().Msg("║  BTC moves on Binance                    ║")
 	log.Info().Msg("║  → Polymarket odds stale                 ║")
 	log.Info().Msg("║  → Buy mispriced outcome                 ║")
-	log.Info().Msg("║  → Collect $1 on resolution              ║")
+	log.Info().Msg("║  → Exit at 75¢ OR hold to resolution     ║")
+	log.Info().Msg("║                                          ║")
+	log.Info().Msg("║  Price Sources:                          ║")
+	log.Info().Msg("║  📈 Binance (fast detection)             ║")
+	log.Info().Msg("║  ⛓️ Chainlink (resolution oracle)        ║")
 	log.Info().Msg("╚══════════════════════════════════════════╝")
 	log.Info().Msg("")
 	log.Info().Msg("💡 Use /help for commands")
@@ -165,6 +178,7 @@ func main() {
 	telegramBot.Stop()
 	arbEngine.Stop()
 	windowScanner.Stop()
+	chainlinkClient.Stop()
 	binanceClient.Stop()
 
 	log.Info().Msg("👋 Goodbye!")

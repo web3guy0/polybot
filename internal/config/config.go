@@ -38,18 +38,21 @@ SignerAddress    string // Address that signed/derived the API credentials
 FunderAddress    string // Address that holds funds (may differ from signing key)
 SignatureType    int    // 0=EOA, 1=Magic/Email, 2=Proxy
 
-// Arbitrage Settings
-ArbEnabled         bool
-ArbMinPriceMove    decimal.Decimal // e.g., 0.002 = 0.2%
-ArbMaxOddsForEntry decimal.Decimal // e.g., 0.65 = 65 cents
-ArbMinEdge         decimal.Decimal // e.g., 0.10 = 10%
-ArbPositionSize    decimal.Decimal // USD per trade
-ArbMaxDailyTrades  int
-ArbCooldownSeconds int
+	// Arbitrage Settings
+	ArbEnabled         bool
+	ArbMinPriceMove    decimal.Decimal // e.g., 0.002 = 0.2%
+	ArbMinOddsForEntry decimal.Decimal // e.g., 0.35 = 35 cents (min entry)
+	ArbMaxOddsForEntry decimal.Decimal // e.g., 0.65 = 65 cents (max entry)
+	ArbMinEdge         decimal.Decimal // e.g., 0.10 = 10%
+	ArbPositionSize    decimal.Decimal // USD per trade
+	ArbMaxDailyTrades  int
+	ArbCooldownSeconds int
 
-// Risk
-MaxDailyLoss decimal.Decimal
-Bankroll     decimal.Decimal
+	// Triple Exit Strategy
+	ArbExitOddsThreshold decimal.Decimal // e.g., 0.75 = exit at 75¢ for quick flip
+	ArbHoldThreshold     decimal.Decimal // e.g., 0.005 = 0.5% BTC move confirms direction
+	ArbStopLossPct       decimal.Decimal // e.g., 0.20 = 20% stop-loss
+	Bankroll     decimal.Decimal
 
 // Database
 DatabasePath string
@@ -82,18 +85,21 @@ SignerAddress:    os.Getenv("SIGNER_ADDRESS"),
 FunderAddress:    os.Getenv("FUNDER_ADDRESS"),
 SignatureType:    getEnvInt("SIGNATURE_TYPE", 0),
 
-// Arbitrage Settings
-ArbEnabled:         getEnvBool("ARB_ENABLED", true),
-ArbMinPriceMove:    getEnvDecimal("ARB_MIN_PRICE_MOVE", decimal.NewFromFloat(0.002)),
-ArbMaxOddsForEntry: getEnvDecimal("ARB_MAX_ODDS", decimal.NewFromFloat(0.65)),
-ArbMinEdge:         getEnvDecimal("ARB_MIN_EDGE", decimal.NewFromFloat(0.10)),
-ArbPositionSize:    getEnvDecimal("ARB_POSITION_SIZE", decimal.NewFromFloat(1)),
-ArbMaxDailyTrades:  getEnvInt("ARB_MAX_DAILY_TRADES", 200),
-ArbCooldownSeconds: getEnvInt("ARB_COOLDOWN_SECONDS", 10),
+		// Arbitrage Settings
+		ArbEnabled:         getEnvBool("ARB_ENABLED", true),
+		ArbMinPriceMove:    getEnvDecimal("ARB_MIN_PRICE_MOVE", decimal.NewFromFloat(0.002)),
+		ArbMinOddsForEntry: getEnvDecimal("ARB_MIN_ODDS", decimal.NewFromFloat(0.35)),   // Min 35¢
+		ArbMaxOddsForEntry: getEnvDecimal("ARB_MAX_ODDS", decimal.NewFromFloat(0.65)),   // Max 65¢
+		ArbMinEdge:         getEnvDecimal("ARB_MIN_EDGE", decimal.NewFromFloat(0.10)),
+		ArbPositionSize:    getEnvDecimal("ARB_POSITION_SIZE", decimal.NewFromFloat(1)),
+		ArbMaxDailyTrades:  getEnvInt("ARB_MAX_DAILY_TRADES", 200),
+		ArbCooldownSeconds: getEnvInt("ARB_COOLDOWN_SECONDS", 10),
 
-// Risk
-MaxDailyLoss: getEnvDecimal("MAX_DAILY_LOSS", decimal.NewFromFloat(100)),
-Bankroll:     getEnvDecimal("BANKROLL", decimal.NewFromFloat(1000)),
+		// Triple Exit Strategy
+		ArbExitOddsThreshold: getEnvDecimal("ARB_EXIT_ODDS", decimal.NewFromFloat(0.75)),       // Sell at 75¢+
+		ArbHoldThreshold:     getEnvDecimal("ARB_HOLD_THRESHOLD", decimal.NewFromFloat(0.005)), // 0.5% BTC confirms direction
+		ArbStopLossPct:       getEnvDecimal("ARB_STOP_LOSS", decimal.NewFromFloat(0.20)),       // 🛑 20% stop-loss
+		Bankroll:     getEnvDecimal("BANKROLL", decimal.NewFromFloat(1000)),
 
 // Database
 DatabasePath: getEnv("DATABASE_PATH", "data/polybot.db"),

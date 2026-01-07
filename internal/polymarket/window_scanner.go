@@ -36,6 +36,7 @@ type PredictionWindow struct {
 	// Market info
 	Volume    decimal.Decimal
 	Liquidity decimal.Decimal
+	StartDate time.Time // Window start time (used to get "Price to Beat")
 	EndDate   time.Time
 	Active    bool
 	Closed    bool
@@ -95,8 +96,8 @@ func (s *WindowScanner) scanLoop() {
 	// Scan immediately
 	s.scan()
 
-	// Then scan every 30 seconds
-	ticker := time.NewTicker(30 * time.Second)
+	// Then scan every 5 seconds for fast window detection
+	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
 	for {
@@ -199,20 +200,23 @@ func (s *WindowScanner) fetchWindowBySlug(slug string) (*PredictionWindow, error
 	defer resp.Body.Close()
 
 	var events []struct {
-		ID      string `json:"id"`
-		Title   string `json:"title"`
-		Slug    string `json:"slug"`
-		Active  bool   `json:"active"`
-		Closed  bool   `json:"closed"`
-		EndDate string `json:"endDate"`
+		ID             string `json:"id"`
+		Title          string `json:"title"`
+		Slug           string `json:"slug"`
+		Active         bool   `json:"active"`
+		Closed         bool   `json:"closed"`
+		EndDate        string `json:"endDate"`
+		StartTime      string `json:"startTime"`      // Event start time (when window opens)
+		EventStartTime string `json:"eventStartTime"` // Alternative field name
 		Markets []struct {
-			ID            string `json:"id"`
-			ConditionID   string `json:"conditionId"`
-			Question      string `json:"question"`
-			Outcomes      string `json:"outcomes"`
-			OutcomePrices string `json:"outcomePrices"`
-			ClobTokenIds  string `json:"clobTokenIds"`
-			Volume        string `json:"volume"`
+			ID             string `json:"id"`
+			ConditionID    string `json:"conditionId"`
+			Question       string `json:"question"`
+			Outcomes       string `json:"outcomes"`
+			OutcomePrices  string `json:"outcomePrices"`
+			ClobTokenIds   string `json:"clobTokenIds"`
+			Volume         string `json:"volume"`
+			EventStartTime string `json:"eventStartTime"` // Market-level start time
 		} `json:"markets"`
 	}
 
@@ -226,6 +230,11 @@ func (s *WindowScanner) fetchWindowBySlug(slug string) (*PredictionWindow, error
 
 	event := events[0]
 	market := event.Markets[0]
+
+	// Skip markets with no prices (no liquidity)
+	if market.OutcomePrices == "" || market.OutcomePrices == "null" {
+		return nil, nil
+	}
 
 	// Parse outcomes ["Up", "Down"]
 	var outcomes []string
@@ -259,6 +268,16 @@ func (s *WindowScanner) fetchWindowBySlug(slug string) (*PredictionWindow, error
 		endDate, _ = time.Parse(time.RFC3339, event.EndDate)
 	}
 
+	// Parse start date (event start time = when window opens)
+	var startDate time.Time
+	if market.EventStartTime != "" {
+		startDate, _ = time.Parse(time.RFC3339, market.EventStartTime)
+	} else if event.StartTime != "" {
+		startDate, _ = time.Parse(time.RFC3339, event.StartTime)
+	} else if event.EventStartTime != "" {
+		startDate, _ = time.Parse(time.RFC3339, event.EventStartTime)
+	}
+
 	// Detect window minutes from slug
 	windowMinutes := 15
 	if strings.Contains(slug, "-5m-") {
@@ -280,6 +299,7 @@ func (s *WindowScanner) fetchWindowBySlug(slug string) (*PredictionWindow, error
 		YesPrice:      yesPrice,
 		NoPrice:       noPrice,
 		Volume:        volume,
+		StartDate:     startDate,
 		EndDate:       endDate,
 		Active:        event.Active,
 		Closed:        event.Closed,

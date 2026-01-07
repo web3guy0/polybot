@@ -326,6 +326,41 @@ func (c *Client) GetKlines(symbol, interval string, limit int) ([]Kline, error) 
 	return klines, nil
 }
 
+// GetPriceAtTime fetches the BTC price at a specific timestamp using 1-second klines
+// This is used to get the "Price to Beat" for Polymarket windows
+// Returns the open price of the 1-second candle at the given timestamp
+func (c *Client) GetPriceAtTime(t time.Time) (decimal.Decimal, error) {
+	// Convert to milliseconds for Binance API
+	startMs := t.Unix() * 1000
+	endMs := startMs + 1000 // Just 1 second
+	
+	url := fmt.Sprintf("%s/api/v3/klines?symbol=BTCUSDT&interval=1s&startTime=%d&endTime=%d&limit=1",
+		c.restURL, startMs, endMs)
+	
+	resp, err := http.Get(url)
+	if err != nil {
+		return decimal.Zero, fmt.Errorf("failed to fetch 1s kline: %w", err)
+	}
+	defer resp.Body.Close()
+	
+	var raw [][]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		return decimal.Zero, fmt.Errorf("failed to decode kline: %w", err)
+	}
+	
+	if len(raw) == 0 {
+		return decimal.Zero, fmt.Errorf("no kline data for timestamp %d", t.Unix())
+	}
+	
+	// Return the open price of the kline
+	open, err := decimal.NewFromString(raw[0][1].(string))
+	if err != nil {
+		return decimal.Zero, fmt.Errorf("failed to parse price: %w", err)
+	}
+	
+	return open, nil
+}
+
 // GetOrderBook fetches order book via REST
 func (c *Client) GetOrderBook(symbol string, limit int) (*OrderBook, error) {
 	url := fmt.Sprintf("%s/api/v3/depth?symbol=%s&limit=%d",

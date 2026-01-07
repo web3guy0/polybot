@@ -816,3 +816,69 @@ func (c *CLOBClient) signClobAuthMessage(timestamp int64, nonce int64) (string, 
 
 	return "0x" + hex.EncodeToString(sig), nil
 }
+
+// GetMidPrice fetches the mid price for a token from the CLOB orderbook
+// This is faster than using the gamma API for price discovery
+func (c *CLOBClient) GetMidPrice(tokenID string) (decimal.Decimal, error) {
+	// Use the CLOB price endpoint for fast price lookup
+	url := fmt.Sprintf("%s/price?token_id=%s&side=BUY", c.baseURL, tokenID)
+	
+	resp, err := c.httpClient.Get(url)
+	if err != nil {
+		return decimal.Zero, err
+	}
+	defer resp.Body.Close()
+	
+	if resp.StatusCode != http.StatusOK {
+		return decimal.Zero, fmt.Errorf("price lookup failed: %d", resp.StatusCode)
+	}
+	
+	var result struct {
+		Price string `json:"price"`
+	}
+	
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return decimal.Zero, err
+	}
+	
+	return decimal.NewFromString(result.Price)
+}
+
+// GetBookPrice fetches the best bid/ask from the orderbook for a token
+func (c *CLOBClient) GetBookPrice(tokenID string) (bestBid, bestAsk decimal.Decimal, err error) {
+	url := fmt.Sprintf("%s/book?token_id=%s", c.baseURL, tokenID)
+	
+	resp, err := c.httpClient.Get(url)
+	if err != nil {
+		return decimal.Zero, decimal.Zero, err
+	}
+	defer resp.Body.Close()
+	
+	if resp.StatusCode != http.StatusOK {
+		return decimal.Zero, decimal.Zero, fmt.Errorf("book lookup failed: %d", resp.StatusCode)
+	}
+	
+	var result struct {
+		Bids []struct {
+			Price string `json:"price"`
+			Size  string `json:"size"`
+		} `json:"bids"`
+		Asks []struct {
+			Price string `json:"price"`
+			Size  string `json:"size"`
+		} `json:"asks"`
+	}
+	
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return decimal.Zero, decimal.Zero, err
+	}
+	
+	if len(result.Bids) > 0 {
+		bestBid, _ = decimal.NewFromString(result.Bids[0].Price)
+	}
+	if len(result.Asks) > 0 {
+		bestAsk, _ = decimal.NewFromString(result.Asks[0].Price)
+	}
+	
+	return bestBid, bestAsk, nil
+}

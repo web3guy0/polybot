@@ -23,6 +23,7 @@ import (
 	"github.com/shopspring/decimal"
 
 	"github.com/web3guy0/polybot/internal/binance"
+	"github.com/web3guy0/polybot/internal/chainlink"
 	"github.com/web3guy0/polybot/internal/config"
 	"github.com/web3guy0/polybot/internal/polymarket"
 )
@@ -59,24 +60,42 @@ type Trade struct {
 	WindowID       string
 	Question       string
 	Direction      string          // "UP" or "DOWN"
+	TokenID        string          // Token ID we bought
 	EntryPrice     decimal.Decimal // What we paid (e.g., 0.45)
+	ExitPrice      decimal.Decimal // What we sold at (0 if held to resolution)
 	Amount         decimal.Decimal // Position size in USD
+	Shares         decimal.Decimal // Number of shares purchased
 	BTCAtEntry     decimal.Decimal // BTC price when we entered
 	BTCAtStart     decimal.Decimal // BTC price at window start
 	PriceChangePct decimal.Decimal // % move that triggered trade
 	Edge           decimal.Decimal // Expected edge at entry
-	Status         string          // "open", "won", "lost"
+	Status         string          // "open", "exited", "won", "lost"
+	ExitType       string          // "quick_flip", "resolution", ""
 	EnteredAt      time.Time
+	ExitedAt       *time.Time
 	ResolvedAt     *time.Time
 	Profit         decimal.Decimal
 }
 
+// OpenPosition represents an active position being monitored for exit
+type OpenPosition struct {
+	Trade          *Trade
+	TokenID        string
+	Direction      string          // "UP" or "DOWN"
+	EntryPrice     decimal.Decimal
+	Shares         decimal.Decimal
+	BTCMoveAtEntry decimal.Decimal // The % BTC move when we entered
+	WindowEndTime  time.Time
+	EnteredAt      time.Time
+}
+
 // Engine is the core latency arbitrage engine
 type Engine struct {
-	cfg           *config.Config
-	binanceClient *binance.Client
-	windowScanner *polymarket.WindowScanner
-	clobClient    *CLOBClient // CLOB trading client
+	cfg             *config.Config
+	binanceClient   *binance.Client
+	chainlinkClient *chainlink.Client // Chainlink price feed (what Polymarket uses for resolution)
+	windowScanner   *polymarket.WindowScanner
+	clobClient      *CLOBClient // CLOB trading client
 
 	// Window tracking
 	windowStates map[string]*WindowState
@@ -92,18 +111,32 @@ type Engine struct {
 	dailyPL       decimal.Decimal
 	lastDailyReset time.Time
 
+	// Open position tracking for exit monitoring
+	openPositions map[string]*OpenPosition
+	positionsMu   sync.RWMutex
+
 	// Configuration
 	minPriceMove     decimal.Decimal // Min % move to trigger (default 0.2%)
-	maxOddsForEntry  decimal.Decimal // Max odds we'll pay (default 0.65)
+	minOddsForEntry  decimal.Decimal // Min odds to buy (default 0.35 for 35¢ floor)
+	maxOddsForEntry  decimal.Decimal // Max odds we'll pay (default 0.65 for 35-65¢ range)
 	minEdge          decimal.Decimal // Min expected edge (default 0.10)
 	positionSize     decimal.Decimal // Per-trade size in USD
 	maxDailyTrades   int             // Max trades per day
 	maxTradesPerWindow int           // Max trades per window
 	cooldownSeconds  int             // Seconds between trades
 
+	// Exit Strategy Configuration (3 paths)
+	// Exit Path A: Quick flip when odds reach 75¢+
+	// Exit Path B: Hold to resolution when move is large and time is short
+	// Exit Path C: STOP-LOSS when odds drop 20% from entry
+	exitOddsThreshold  decimal.Decimal // Sell when odds reach this (default 0.75)
+	holdThreshold      decimal.Decimal // Hold if price move exceeds this % (default 0.005 = 0.5%)
+	stopLossPct        decimal.Decimal // Stop-loss: exit if odds drop this % from entry (default 0.20 = 20%)
+
 	// Callbacks
 	onOpportunity func(Opportunity)
 	onTrade       func(Trade)
+	onExit        func(Trade) // Called when position is exited
 
 	running bool
 	stopCh  chan struct{}
@@ -121,31 +154,56 @@ type EngineConfig struct {
 }
 
 // NewEngine creates a new arbitrage engine
-func NewEngine(cfg *config.Config, bc *binance.Client, ws *polymarket.WindowScanner) *Engine {
+// Optimized for PurpleThunder strategy: buy at 40-50¢, exit at 70-80¢ or hold to resolution
+func NewEngine(cfg *config.Config, bc *binance.Client, cl *chainlink.Client, ws *polymarket.WindowScanner) *Engine {
 	e := &Engine{
 		cfg:              cfg,
 		binanceClient:    bc,
+		chainlinkClient:  cl,
 		windowScanner:    ws,
 		windowStates:     make(map[string]*WindowState),
+		openPositions:    make(map[string]*OpenPosition),
 		trades:           make([]Trade, 0),
 		totalProfit:      decimal.Zero,
 		dailyPL:          decimal.Zero,
 		lastDailyReset:   time.Now(),
 		stopCh:           make(chan struct{}),
 
-		// Default config - can be overridden by env vars
-		minPriceMove:       decimal.NewFromFloat(0.002),  // 0.2%
-		maxOddsForEntry:    decimal.NewFromFloat(0.65),   // 65 cents max
+		// Default config - FEE-ADJUSTED strategy (with 3.15% Polymarket fee)
+		// Buy at 35-65¢, exit at 75¢ OR stop-loss at -20% OR hold to resolution
+		minPriceMove:       decimal.NewFromFloat(0.002),  // 0.2% min move
+		minOddsForEntry:    decimal.NewFromFloat(0.35),   // 35 cents min (avoid extreme odds)
+		maxOddsForEntry:    decimal.NewFromFloat(0.65),   // 65 cents max (wider range)
 		minEdge:            decimal.NewFromFloat(0.10),   // 10% min edge
 		positionSize:       decimal.NewFromFloat(100),    // $100 per trade
 		maxDailyTrades:     200,
 		maxTradesPerWindow: 3,
 		cooldownSeconds:    10,
+
+		// Triple exit strategy thresholds
+		exitOddsThreshold:  decimal.NewFromFloat(0.75),   // Quick flip at 75¢
+		holdThreshold:      decimal.NewFromFloat(0.002),  // Hold if move > 0.2% (~$180 on BTC)
+		stopLossPct:        decimal.NewFromFloat(0.20),   // 🛑 STOP-LOSS: exit if odds drop 20%
 	}
 
 	// Override from config if set
 	if cfg.ArbPositionSize.GreaterThan(decimal.Zero) {
 		e.positionSize = cfg.ArbPositionSize
+	}
+	if cfg.ArbMinOddsForEntry.GreaterThan(decimal.Zero) {
+		e.minOddsForEntry = cfg.ArbMinOddsForEntry
+	}
+	if cfg.ArbMaxOddsForEntry.GreaterThan(decimal.Zero) {
+		e.maxOddsForEntry = cfg.ArbMaxOddsForEntry
+	}
+	if cfg.ArbExitOddsThreshold.GreaterThan(decimal.Zero) {
+		e.exitOddsThreshold = cfg.ArbExitOddsThreshold
+	}
+	if cfg.ArbHoldThreshold.GreaterThan(decimal.Zero) {
+		e.holdThreshold = cfg.ArbHoldThreshold
+	}
+	if cfg.ArbStopLossPct.GreaterThan(decimal.Zero) {
+		e.stopLossPct = cfg.ArbStopLossPct
 	}
 
 	return e
@@ -155,6 +213,11 @@ func NewEngine(cfg *config.Config, bc *binance.Client, ws *polymarket.WindowScan
 func (e *Engine) SetCLOBClient(client *CLOBClient) {
 	e.clobClient = client
 	log.Info().Msg("🔗 CLOB client connected to engine")
+}
+
+// SetExitCallback sets callback for position exits
+func (e *Engine) SetExitCallback(cb func(Trade)) {
+	e.onExit = cb
 }
 
 // SetConfig updates engine configuration
@@ -208,11 +271,34 @@ func (e *Engine) IsLive() bool {
 	return !e.cfg.DryRun
 }
 
+// GetBTCPrice returns the current BTC price from Binance with Chainlink comparison
+// Binance is used for real-time detection, Chainlink is what Polymarket uses for resolution
+func (e *Engine) GetBTCPrice() (binancePrice, chainlinkPrice decimal.Decimal, priceDiff decimal.Decimal) {
+	binancePrice = e.binanceClient.GetCurrentPrice()
+	
+	if e.chainlinkClient != nil {
+		chainlinkPrice = e.chainlinkClient.GetCurrentPrice()
+		if !chainlinkPrice.IsZero() && !binancePrice.IsZero() {
+			priceDiff = binancePrice.Sub(chainlinkPrice).Div(chainlinkPrice).Mul(decimal.NewFromInt(100))
+		}
+	}
+	
+	return binancePrice, chainlinkPrice, priceDiff
+}
+
+// GetChainlinkPrice returns the Chainlink price (what Polymarket uses for resolution)
+func (e *Engine) GetChainlinkPrice() decimal.Decimal {
+	if e.chainlinkClient != nil {
+		return e.chainlinkClient.GetCurrentPrice()
+	}
+	return decimal.Zero
+}
+
 // Start begins the arbitrage engine
 func (e *Engine) Start() {
 	e.running = true
 
-	// Main arbitrage loop - check every 500ms for speed
+	// Main arbitrage loop - check every 100ms for speed (critical for 30-90s lag window)
 	go e.arbitrageLoop()
 
 	// Window state updater - refresh window start prices
@@ -221,11 +307,16 @@ func (e *Engine) Start() {
 	// Odds refresher - keep odds fresh
 	go e.oddsRefreshLoop()
 
+	// Position monitor - check for exit opportunities every 100ms
+	go e.positionMonitorLoop()
+
 	log.Info().
 		Str("min_move", e.minPriceMove.Mul(decimal.NewFromInt(100)).String()+"%").
-		Str("max_odds", e.maxOddsForEntry.String()).
+		Str("entry_range", e.minOddsForEntry.String()+"-"+e.maxOddsForEntry.String()).
+		Str("exit_target", e.exitOddsThreshold.String()).
+		Str("stop_loss", e.stopLossPct.Mul(decimal.NewFromInt(100)).String()+"%").
 		Str("position_size", e.positionSize.String()).
-		Msg("⚡ Latency Arbitrage Engine started")
+		Msg("⚡ Latency Arbitrage Engine started (100ms scan)")
 }
 
 // Stop stops the engine
@@ -235,9 +326,10 @@ func (e *Engine) Stop() {
 	log.Info().Msg("Arbitrage engine stopped")
 }
 
-// arbitrageLoop is the main loop checking for opportunities every 500ms
+// arbitrageLoop is the main loop checking for opportunities every 100ms
+// Speed is critical - the 30-90 second lag window requires fast detection
 func (e *Engine) arbitrageLoop() {
-	ticker := time.NewTicker(500 * time.Millisecond)
+	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 
 	for {
@@ -252,7 +344,7 @@ func (e *Engine) arbitrageLoop() {
 
 // windowStateLoop updates window states every 30 seconds
 func (e *Engine) windowStateLoop() {
-	ticker := time.NewTicker(30 * time.Second)
+	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
 	// Initial update
@@ -270,7 +362,7 @@ func (e *Engine) windowStateLoop() {
 
 // oddsRefreshLoop refreshes odds every 2 seconds
 func (e *Engine) oddsRefreshLoop() {
-	ticker := time.NewTicker(2 * time.Second)
+	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
 
 	for {
@@ -283,15 +375,204 @@ func (e *Engine) oddsRefreshLoop() {
 	}
 }
 
+// positionMonitorLoop monitors open positions for exit opportunities every 100ms
+// Implements dual exit strategy:
+// - Quick Flip: Sell when odds reach 70-80¢ (30-90 seconds after entry typically)
+// - Hold to Resolution: Keep position if BTC move was large (>0.5%) and time remaining is short
+func (e *Engine) positionMonitorLoop() {
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			e.checkPositionExits()
+		case <-e.stopCh:
+			return
+		}
+	}
+}
+
+// checkPositionExits evaluates all open positions for exit conditions
+func (e *Engine) checkPositionExits() {
+	e.positionsMu.RLock()
+	positions := make([]*OpenPosition, 0, len(e.openPositions))
+	for _, pos := range e.openPositions {
+		positions = append(positions, pos)
+	}
+	e.positionsMu.RUnlock()
+
+	if len(positions) == 0 {
+		return
+	}
+
+	oddsFetcher := NewOddsFetcher()
+
+	for _, pos := range positions {
+		// Get current odds for this token
+		odds, err := oddsFetcher.GetLiveOdds(pos.TokenID)
+		if err != nil {
+			continue
+		}
+
+		// Check exit conditions
+		exitType, shouldExit := e.shouldExitPosition(pos, odds)
+		if shouldExit {
+			e.executeExit(pos, odds, exitType)
+		}
+	}
+}
+
+// shouldExitPosition determines if we should exit a position and how
+// Returns (exitType, shouldExit)
+// Three exit paths:
+//   A) Quick flip at 75¢+ (profit taking)
+//   B) Hold to resolution if large move + short time
+//   C) STOP-LOSS at -20% (risk management - CRITICAL!)
+func (e *Engine) shouldExitPosition(pos *OpenPosition, odds *LiveOdds) (string, bool) {
+	timeRemaining := time.Until(pos.WindowEndTime)
+
+	// ⚠️ EXIT PATH C: STOP-LOSS - CHECK FIRST! (Most important for risk management)
+	// If odds have dropped 20% from entry, cut losses immediately
+	// E.g., bought at 50¢, now at 40¢ → 20% drop → STOP LOSS
+	if !pos.EntryPrice.IsZero() && !odds.BestBid.IsZero() {
+		priceDropPct := pos.EntryPrice.Sub(odds.BestBid).Div(pos.EntryPrice)
+		
+		if priceDropPct.GreaterThanOrEqual(e.stopLossPct) {
+			loss := pos.EntryPrice.Sub(odds.BestBid).Mul(pos.Shares)
+			log.Warn().
+				Str("position", pos.Trade.ID).
+				Str("entry", pos.EntryPrice.String()).
+				Str("current", odds.BestBid.String()).
+				Str("drop_pct", priceDropPct.Mul(decimal.NewFromInt(100)).StringFixed(1)+"%").
+				Str("loss", loss.Neg().String()).
+				Msg("🛑 STOP-LOSS TRIGGERED - Cutting losses!")
+			return "stop_loss", true
+		}
+	}
+
+	// Exit Path B: Hold to resolution if move was large AND time is short
+	// If BTC moved >0.5% and less than 2 minutes remain, hold for $1.00 payout
+	if pos.BTCMoveAtEntry.Abs().GreaterThanOrEqual(e.holdThreshold) && timeRemaining < 2*time.Minute {
+		log.Debug().
+			Str("position", pos.Trade.ID).
+			Str("btc_move", pos.BTCMoveAtEntry.Mul(decimal.NewFromInt(100)).String()+"%").
+			Str("time_remaining", timeRemaining.String()).
+			Msg("📊 Holding to resolution - large move, short time")
+		return "", false // Don't exit, hold to resolution
+	}
+
+	// Exit Path A: Quick flip when odds catch up to 75¢+
+	// BestBid is what we can sell at
+	if odds.BestBid.GreaterThanOrEqual(e.exitOddsThreshold) {
+		profit := odds.BestBid.Sub(pos.EntryPrice).Mul(pos.Shares)
+		profitPct := odds.BestBid.Sub(pos.EntryPrice).Div(pos.EntryPrice).Mul(decimal.NewFromInt(100))
+
+		log.Info().
+			Str("position", pos.Trade.ID).
+			Str("entry", pos.EntryPrice.String()).
+			Str("exit", odds.BestBid.String()).
+			Str("profit", profit.String()).
+			Str("profit_pct", profitPct.StringFixed(1)+"%").
+			Msg("🎯 Quick flip exit triggered")
+
+		return "quick_flip", true
+	}
+
+	// Fallback: If less than 30 seconds remain and we're in profit, exit
+	if timeRemaining < 30*time.Second && odds.BestBid.GreaterThan(pos.EntryPrice) {
+		return "quick_flip", true
+	}
+
+	return "", false
+}
+
+// executeExit sells the position
+func (e *Engine) executeExit(pos *OpenPosition, odds *LiveOdds, exitType string) {
+	if e.cfg.DryRun || e.clobClient == nil {
+		// Dry run - just log and update state
+		e.recordExit(pos, odds.BestBid, exitType, true)
+		return
+	}
+
+	// Place market sell order
+	resp, err := e.clobClient.PlaceMarketSell(pos.TokenID, pos.Shares)
+	if err != nil {
+		log.Error().Err(err).Str("position", pos.Trade.ID).Msg("Failed to execute exit")
+		return
+	}
+
+	if resp.Status == "matched" || resp.Status == "filled" {
+		e.recordExit(pos, odds.BestBid, exitType, true)
+	} else {
+		log.Warn().Str("status", resp.Status).Str("position", pos.Trade.ID).Msg("Exit order not filled")
+	}
+}
+
+// recordExit updates trade state after exit
+func (e *Engine) recordExit(pos *OpenPosition, exitPrice decimal.Decimal, exitType string, success bool) {
+	now := time.Now()
+	profit := exitPrice.Sub(pos.EntryPrice).Mul(pos.Shares)
+
+	// Update trade
+	e.tradesMu.Lock()
+	for i := range e.trades {
+		if e.trades[i].ID == pos.Trade.ID {
+			e.trades[i].Status = "exited"
+			e.trades[i].ExitType = exitType
+			e.trades[i].ExitPrice = exitPrice
+			e.trades[i].ExitedAt = &now
+			e.trades[i].Profit = profit
+
+			// Update stats
+			e.totalProfit = e.totalProfit.Add(profit)
+			e.dailyPL = e.dailyPL.Add(profit)
+			if profit.IsPositive() {
+				e.wonTrades++
+			} else {
+				e.lostTrades++
+			}
+
+			// Fire callback
+			if e.onExit != nil {
+				e.onExit(e.trades[i])
+			}
+			break
+		}
+	}
+	e.tradesMu.Unlock()
+
+	// Remove from open positions
+	e.positionsMu.Lock()
+	delete(e.openPositions, pos.Trade.ID)
+	e.positionsMu.Unlock()
+
+	log.Info().
+		Str("id", pos.Trade.ID).
+		Str("direction", pos.Direction).
+		Str("entry", pos.EntryPrice.String()).
+		Str("exit", exitPrice.String()).
+		Str("profit", profit.String()).
+		Str("exit_type", exitType).
+		Msg("💰 Position exited")
+}
+
 // updateWindowStates tracks active windows and their start prices
 func (e *Engine) updateWindowStates() {
 	windows := e.windowScanner.GetActiveWindows()
-	currentBTC := e.binanceClient.GetCurrentPrice()
+	binancePrice, chainlinkPrice, priceDiff := e.GetBTCPrice()
 
-	log.Debug().
+	// Log both price sources for comparison
+	logEvent := log.Debug().
 		Int("active_windows", len(windows)).
-		Str("btc_price", currentBTC.String()).
-		Msg("📊 Window state update")
+		Str("binance", binancePrice.StringFixed(2))
+	
+	if !chainlinkPrice.IsZero() {
+		logEvent = logEvent.
+			Str("chainlink", chainlinkPrice.StringFixed(2)).
+			Str("diff_pct", priceDiff.StringFixed(4)+"%")
+	}
+	logEvent.Msg("📊 Window state update")
 
 	e.windowsMu.Lock()
 	defer e.windowsMu.Unlock()
@@ -300,16 +581,65 @@ func (e *Engine) updateWindowStates() {
 	for i := range windows {
 		w := &windows[i]
 		if _, exists := e.windowStates[w.ID]; !exists {
-			// New window - record start price
+			// New window - get the "Price to Beat" from Chainlink on-chain historical data
+			// Polymarket uses Chainlink Data Streams for resolution, so on-chain Chainlink
+			// is the closest approximation (~$30 difference vs ~$80 with Binance)
+			var startPrice decimal.Decimal
+			
+			// Primary method: Chainlink on-chain historical price at window start
+			// This queries getRoundData() backwards to find the round just before window start
+			if e.chainlinkClient != nil && !w.StartDate.IsZero() {
+				historicalPrice, err := e.chainlinkClient.GetHistoricalPrice(w.StartDate)
+				if err == nil && !historicalPrice.IsZero() {
+					startPrice = historicalPrice
+					log.Info().
+						Str("window_start", w.StartDate.Format("15:04:05")).
+						Str("price_to_beat", startPrice.StringFixed(2)).
+						Msg("⛓️ Got Price to Beat from Chainlink on-chain")
+				} else {
+					log.Debug().Err(err).Msg("Could not get Chainlink historical price")
+				}
+			}
+			
+			// Fallback to Binance 1s kline if Chainlink historical not available
+			if startPrice.IsZero() && e.binanceClient != nil && !w.StartDate.IsZero() {
+				historicalPrice, err := e.binanceClient.GetPriceAtTime(w.StartDate)
+				if err == nil && !historicalPrice.IsZero() {
+					startPrice = historicalPrice
+					log.Info().
+						Str("window_start", w.StartDate.Format("15:04:05")).
+						Str("price_to_beat", startPrice.StringFixed(2)).
+						Msg("📈 Got Price to Beat from Binance (fallback)")
+				}
+			}
+			
+			// Fallback to current Chainlink price
+			if startPrice.IsZero() && !chainlinkPrice.IsZero() {
+				startPrice = chainlinkPrice
+				log.Debug().Str("price", startPrice.StringFixed(2)).Msg("Using current Chainlink price as fallback")
+			}
+			// Final fallback to current Binance price
+			if startPrice.IsZero() {
+				startPrice = binancePrice
+				log.Debug().Str("price", startPrice.StringFixed(2)).Msg("Using current Binance price as fallback")
+			}
+			
 			e.windowStates[w.ID] = &WindowState{
 				Window:     w,
-				StartPrice: currentBTC,
-				StartTime:  time.Now(),
+				StartPrice: startPrice,
+				StartTime:  w.StartDate, // Use actual window start, not when we saw it
 			}
-			log.Debug().
+			
+			// If StartTime is zero, use current time
+			if e.windowStates[w.ID].StartTime.IsZero() {
+				e.windowStates[w.ID].StartTime = time.Now()
+			}
+			
+			log.Info().
 				Str("window", truncate(w.Question, 50)).
-				Str("start_price", currentBTC.String()).
-				Msg("📊 New window tracked")
+				Str("price_to_beat", startPrice.StringFixed(2)).
+				Str("start_time", e.windowStates[w.ID].StartTime.Format("15:04:05")).
+				Msg("📊 Window tracked")
 		}
 	}
 
@@ -326,12 +656,25 @@ func (e *Engine) updateWindowStates() {
 }
 
 // refreshOdds fetches latest odds for all tracked windows
+// Uses direct CLOB API for faster price updates when available
 func (e *Engine) refreshOdds() {
 	e.windowsMu.Lock()
 	defer e.windowsMu.Unlock()
 
 	for _, state := range e.windowStates {
-		// Get fresh window data from scanner
+		// Try direct CLOB price fetch first (faster)
+		if e.clobClient != nil && state.Window.YesTokenID != "" {
+			// Fetch Yes token price directly from CLOB
+			yesPrice, err := e.clobClient.GetMidPrice(state.Window.YesTokenID)
+			if err == nil && !yesPrice.IsZero() {
+				state.CurrentUpOdds = yesPrice
+				state.CurrentDownOdds = decimal.NewFromInt(1).Sub(yesPrice)
+				state.LastOddsCheck = time.Now()
+				continue
+			}
+		}
+		
+		// Fallback to scanner cache
 		freshWindow := e.windowScanner.GetWindowByID(state.Window.ID)
 		if freshWindow != nil {
 			state.CurrentUpOdds = freshWindow.YesPrice
@@ -398,8 +741,12 @@ func (e *Engine) analyzeWindow(state *WindowState, currentBTC decimal.Decimal) *
 	}
 
 	// Check if odds are stale (still cheap despite the move)
+	// Entry range: 35¢-65¢ (with new Polymarket fees, wider range is better)
 	if marketOdds.GreaterThan(e.maxOddsForEntry) {
-		return nil // Market has already adjusted
+		return nil // Too expensive - market has already adjusted
+	}
+	if marketOdds.LessThan(e.minOddsForEntry) {
+		return nil // Too cheap - something is wrong or too risky
 	}
 
 	// Calculate fair odds based on historical data
@@ -540,21 +887,6 @@ func (e *Engine) shouldTrade(state *WindowState) bool {
 
 // executeTrade executes an arbitrage trade
 func (e *Engine) executeTrade(opp Opportunity, state *WindowState) *Trade {
-	trade := &Trade{
-		ID:             fmt.Sprintf("arb_%d", time.Now().UnixNano()),
-		WindowID:       opp.Window.ID,
-		Question:       opp.Window.Question,
-		Direction:      opp.Direction,
-		EntryPrice:     opp.MarketOdds,
-		Amount:         e.positionSize,
-		BTCAtEntry:     opp.CurrentBTC,
-		BTCAtStart:     opp.StartBTC,
-		PriceChangePct: opp.PriceChangePct,
-		Edge:           opp.Edge,
-		Status:         "open",
-		EnteredAt:      time.Now(),
-	}
-
 	// Determine which token to buy (YES=Up, NO=Down)
 	var tokenID string
 	if opp.Direction == "UP" {
@@ -563,9 +895,32 @@ func (e *Engine) executeTrade(opp Opportunity, state *WindowState) *Trade {
 		tokenID = opp.Window.NoTokenID
 	}
 
+	// Safety check for zero odds
+	if opp.MarketOdds.IsZero() || opp.MarketOdds.LessThanOrEqual(decimal.Zero) {
+		log.Error().Msg("Cannot execute trade: MarketOdds is zero")
+		return nil
+	}
+
 	// Calculate size: $amount / price = shares
 	// E.g., $1 / 0.45 = 2.22 shares
 	shares := e.positionSize.Div(opp.MarketOdds).Round(2)
+
+	trade := &Trade{
+		ID:             fmt.Sprintf("arb_%d", time.Now().UnixNano()),
+		WindowID:       opp.Window.ID,
+		Question:       opp.Window.Question,
+		Direction:      opp.Direction,
+		TokenID:        tokenID,
+		EntryPrice:     opp.MarketOdds,
+		Amount:         e.positionSize,
+		Shares:         shares,
+		BTCAtEntry:     opp.CurrentBTC,
+		BTCAtStart:     opp.StartBTC,
+		PriceChangePct: opp.PriceChangePct,
+		Edge:           opp.Edge,
+		Status:         "open",
+		EnteredAt:      time.Now(),
+	}
 
 	log.Info().
 		Str("direction", trade.Direction).
@@ -575,7 +930,8 @@ func (e *Engine) executeTrade(opp Opportunity, state *WindowState) *Trade {
 		Str("btc_move", trade.PriceChangePct.String()+"%").
 		Str("edge", trade.Edge.Mul(decimal.NewFromInt(100)).String()+"%").
 		Str("window", truncate(trade.Question, 40)).
-		Msg("⚡ ARBITRAGE TRADE SIGNAL")
+		Bool("live", !e.cfg.DryRun).
+		Msg("⚡ ARBITRAGE TRADE")
 
 	// Execute actual trade if CLOB client is available
 	if e.clobClient != nil && tokenID != "" {
@@ -587,20 +943,22 @@ func (e *Engine) executeTrade(opp Opportunity, state *WindowState) *Trade {
 				Str("shares", shares.String()).
 				Msg("❌ Order placement failed")
 			trade.Status = "failed"
-		} else {
-			log.Info().
-				Str("order_id", orderResp.OrderID).
-				Str("status", orderResp.Status).
-				Msg("✅ Order placed successfully")
-			trade.ID = orderResp.OrderID
-			trade.Status = "filled"
+			return nil
 		}
+
+		log.Info().
+			Str("order_id", orderResp.OrderID).
+			Str("status", orderResp.Status).
+			Msg("✅ Order filled")
+		trade.ID = orderResp.OrderID
+		trade.Status = "filled"
 	} else if e.clobClient == nil {
 		log.Warn().Msg("⚠️ CLOB client not connected - trade simulated only")
 		trade.Status = "simulated"
 	} else {
 		log.Warn().Str("direction", opp.Direction).Msg("⚠️ No token ID for direction - trade skipped")
 		trade.Status = "skipped"
+		return nil
 	}
 
 	// Track trade
@@ -608,6 +966,27 @@ func (e *Engine) executeTrade(opp Opportunity, state *WindowState) *Trade {
 	e.trades = append(e.trades, *trade)
 	e.totalTrades++
 	e.tradesMu.Unlock()
+
+	// Add to open positions for exit monitoring (dual exit strategy)
+	if trade.Status == "filled" || trade.Status == "simulated" {
+		e.positionsMu.Lock()
+		e.openPositions[trade.ID] = &OpenPosition{
+			Trade:          trade,
+			TokenID:        tokenID,
+			Direction:      opp.Direction,
+			EntryPrice:     opp.MarketOdds,
+			Shares:         shares,
+			BTCMoveAtEntry: opp.PriceChangePct.Div(decimal.NewFromInt(100)), // Convert back to decimal
+			WindowEndTime:  opp.Window.EndDate,
+			EnteredAt:      time.Now(),
+		}
+		e.positionsMu.Unlock()
+
+		log.Debug().
+			Str("trade_id", trade.ID).
+			Str("exit_target", e.exitOddsThreshold.String()).
+			Msg("📊 Position tracked for exit monitoring")
+	}
 
 	return trade
 }
