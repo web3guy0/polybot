@@ -9,7 +9,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -117,6 +116,8 @@ func (s *WindowScanner) scan() {
 		return
 	}
 
+	log.Info().Int("found", len(windows)).Str("asset", s.asset).Msg("🔍 Windows scan complete")
+
 	s.windowsMu.Lock()
 	oldWindows := make(map[string]bool)
 	for _, w := range s.windows {
@@ -131,97 +132,164 @@ func (s *WindowScanner) scan() {
 		if !oldWindows[w.ID] && s.onNewWindow != nil {
 			s.onNewWindow(w)
 		}
+		// Log each window found
+		log.Debug().
+			Str("id", w.ID).
+			Str("question", w.Question[:min(50, len(w.Question))]).
+			Str("up", w.YesPrice.String()).
+			Str("down", w.NoPrice.String()).
+			Msg("📊 Window")
 	}
 
 	log.Debug().Int("windows", len(windows)).Str("asset", s.asset).Msg("Windows updated")
 }
 
 func (s *WindowScanner) fetchWindows() ([]PredictionWindow, error) {
-	// Build search terms based on asset
-	var searchTerms []string
+	// Polymarket crypto windows use timestamp-based slugs:
+	// btc-updown-15m-{timestamp} where timestamp is Unix time aligned to the window interval
+	// Example: btc-updown-15m-1767707100 for the 15-minute window starting at that time
 
-	switch s.asset {
-	case "BTC":
-		searchTerms = []string{"Bitcoin", "BTC", "bitcoin up", "bitcoin down"}
-	case "ETH":
-		searchTerms = []string{"Ethereum", "ETH", "ethereum up", "ethereum down"}
-	case "SOL":
-		searchTerms = []string{"Solana", "SOL", "solana up", "solana down"}
-	default:
-		searchTerms = []string{s.asset, strings.ToLower(s.asset) + " up", strings.ToLower(s.asset) + " down"}
-	}
-
+	now := time.Now().Unix()
 	allWindows := make([]PredictionWindow, 0)
 	seen := make(map[string]bool)
 
-	for _, term := range searchTerms {
-		windows, err := s.searchMarkets(term)
+	// Window types: (prefix, interval in seconds)
+	windowTypes := []struct {
+		suffix   string
+		interval int64
+	}{
+		{"5m", 300},    // 5 minutes
+		{"15m", 900},   // 15 minutes
+		{"1h", 3600},   // 1 hour
+		{"4h", 14400},  // 4 hours
+	}
+
+	// Asset slug prefixes
+	assetPrefix := strings.ToLower(s.asset) + "-updown"
+
+	for _, wt := range windowTypes {
+		// Calculate current window timestamp (aligned to interval)
+		windowTs := (now / wt.interval) * wt.interval
+		slug := fmt.Sprintf("%s-%s-%d", assetPrefix, wt.suffix, windowTs)
+
+		window, err := s.fetchWindowBySlug(slug)
 		if err != nil {
+			log.Debug().Str("slug", slug).Err(err).Msg("Window not found")
 			continue
 		}
 
-		for _, w := range windows {
-			if !seen[w.ID] {
-				seen[w.ID] = true
-				allWindows = append(allWindows, w)
-			}
+		if window != nil && !seen[window.ID] {
+			seen[window.ID] = true
+			allWindows = append(allWindows, *window)
 		}
 	}
 
 	return allWindows, nil
 }
 
-func (s *WindowScanner) searchMarkets(query string) ([]PredictionWindow, error) {
-	// Build search URL
-	params := url.Values{}
-	params.Set("closed", "false")
-	params.Set("active", "true")
-	params.Set("limit", "50")
+// fetchWindowBySlug fetches a single window by its slug from gamma API
+func (s *WindowScanner) fetchWindowBySlug(slug string) (*PredictionWindow, error) {
+	// Use gamma-api.polymarket.com/events endpoint
+	eventsURL := fmt.Sprintf("https://gamma-api.polymarket.com/events?slug=%s", slug)
 
-	searchURL := fmt.Sprintf("%s/markets?%s", s.restURL, params.Encode())
-
-	resp, err := http.Get(searchURL)
+	resp, err := http.Get(eventsURL)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
 
-	var markets []Market
-	if err := json.NewDecoder(resp.Body).Decode(&markets); err != nil {
+	var events []struct {
+		ID      string `json:"id"`
+		Title   string `json:"title"`
+		Slug    string `json:"slug"`
+		Active  bool   `json:"active"`
+		Closed  bool   `json:"closed"`
+		EndDate string `json:"endDate"`
+		Markets []struct {
+			ID            string `json:"id"`
+			ConditionID   string `json:"conditionId"`
+			Question      string `json:"question"`
+			Outcomes      string `json:"outcomes"`
+			OutcomePrices string `json:"outcomePrices"`
+			ClobTokenIds  string `json:"clobTokenIds"`
+			Volume        string `json:"volume"`
+		} `json:"markets"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&events); err != nil {
 		return nil, err
 	}
 
-	windows := make([]PredictionWindow, 0)
-
-	for _, m := range markets {
-		questionLower := strings.ToLower(m.Question)
-
-		// Filter for asset-related markets
-		if !s.matchesAsset(questionLower) {
-			continue
-		}
-
-		// Look for up/down prediction markets
-		isUpDown := strings.Contains(questionLower, "up") ||
-			strings.Contains(questionLower, "down") ||
-			strings.Contains(questionLower, "higher") ||
-			strings.Contains(questionLower, "lower") ||
-			strings.Contains(questionLower, "above") ||
-			strings.Contains(questionLower, "below")
-
-		if !isUpDown {
-			continue
-		}
-
-		window := s.parseMarketToWindow(m)
-		if window != nil {
-			windows = append(windows, *window)
-		}
+	if len(events) == 0 || len(events[0].Markets) == 0 {
+		return nil, nil
 	}
 
-	return windows, nil
+	event := events[0]
+	market := event.Markets[0]
+
+	// Parse outcomes ["Up", "Down"]
+	var outcomes []string
+	if err := json.Unmarshal([]byte(market.Outcomes), &outcomes); err != nil {
+		return nil, err
+	}
+
+	// Parse prices ["0.51", "0.49"]
+	var prices []string
+	if err := json.Unmarshal([]byte(market.OutcomePrices), &prices); err != nil {
+		return nil, err
+	}
+
+	// Parse token IDs
+	var tokenIDs []string
+	if err := json.Unmarshal([]byte(market.ClobTokenIds), &tokenIDs); err != nil {
+		return nil, err
+	}
+
+	if len(prices) < 2 || len(tokenIDs) < 2 {
+		return nil, nil
+	}
+
+	yesPrice, _ := decimal.NewFromString(prices[0])
+	noPrice, _ := decimal.NewFromString(prices[1])
+	volume, _ := decimal.NewFromString(market.Volume)
+
+	// Parse end date
+	var endDate time.Time
+	if event.EndDate != "" {
+		endDate, _ = time.Parse(time.RFC3339, event.EndDate)
+	}
+
+	// Detect window minutes from slug
+	windowMinutes := 15
+	if strings.Contains(slug, "-5m-") {
+		windowMinutes = 5
+	} else if strings.Contains(slug, "-1h-") {
+		windowMinutes = 60
+	} else if strings.Contains(slug, "-4h-") {
+		windowMinutes = 240
+	}
+
+	return &PredictionWindow{
+		ID:            market.ID,
+		ConditionID:   market.ConditionID,
+		Question:      event.Title,
+		Slug:          event.Slug,
+		Asset:         s.asset,
+		YesTokenID:    tokenIDs[0], // Up token
+		NoTokenID:     tokenIDs[1], // Down token
+		YesPrice:      yesPrice,
+		NoPrice:       noPrice,
+		Volume:        volume,
+		EndDate:       endDate,
+		Active:        event.Active,
+		Closed:        event.Closed,
+		WindowMinutes: windowMinutes,
+		WindowType:    "up_down",
+		LastUpdated:   time.Now(),
+	}, nil
 }
 
+// matchesAsset checks if a question matches the scanner's asset
 func (s *WindowScanner) matchesAsset(questionLower string) bool {
 	switch s.asset {
 	case "BTC":
@@ -232,61 +300,6 @@ func (s *WindowScanner) matchesAsset(questionLower string) bool {
 		return strings.Contains(questionLower, "solana") || strings.Contains(questionLower, "sol")
 	default:
 		return strings.Contains(questionLower, strings.ToLower(s.asset))
-	}
-}
-
-func (s *WindowScanner) parseMarketToWindow(m Market) *PredictionWindow {
-	// Parse outcomes and prices
-	var outcomes []string
-	if err := json.Unmarshal([]byte(m.Outcomes), &outcomes); err != nil {
-		return nil
-	}
-
-	var prices []string
-	if err := json.Unmarshal([]byte(m.OutcomePrices), &prices); err != nil {
-		return nil
-	}
-
-	if len(outcomes) < 2 || len(prices) < 2 {
-		return nil
-	}
-
-	yesPrice, _ := decimal.NewFromString(prices[0])
-	noPrice, _ := decimal.NewFromString(prices[1])
-	volume, _ := decimal.NewFromString(m.Volume)
-
-	// Parse end date
-	var endDate time.Time
-	if m.EndDate != "" {
-		endDate, _ = time.Parse(time.RFC3339, m.EndDate)
-	}
-
-	// Detect window type
-	windowMinutes := 15 // Default
-	questionLower := strings.ToLower(m.Question)
-	if strings.Contains(questionLower, "1 hour") || strings.Contains(questionLower, "60 min") {
-		windowMinutes = 60
-	} else if strings.Contains(questionLower, "5 min") {
-		windowMinutes = 5
-	} else if strings.Contains(questionLower, "30 min") {
-		windowMinutes = 30
-	}
-
-	return &PredictionWindow{
-		ID:            m.ID,
-		ConditionID:   m.ConditionID,
-		Question:      m.Question,
-		Slug:          m.Slug,
-		Asset:         s.asset,
-		YesPrice:      yesPrice,
-		NoPrice:       noPrice,
-		Volume:        volume,
-		EndDate:       endDate,
-		Active:        m.Active,
-		Closed:        m.Closed,
-		WindowMinutes: windowMinutes,
-		WindowType:    "up_down",
-		LastUpdated:   time.Now(),
 	}
 }
 

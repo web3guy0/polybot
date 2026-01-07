@@ -76,6 +76,7 @@ type Engine struct {
 	cfg           *config.Config
 	binanceClient *binance.Client
 	windowScanner *polymarket.WindowScanner
+	clobClient    *CLOBClient // CLOB trading client
 
 	// Window tracking
 	windowStates map[string]*WindowState
@@ -148,6 +149,12 @@ func NewEngine(cfg *config.Config, bc *binance.Client, ws *polymarket.WindowScan
 	}
 
 	return e
+}
+
+// SetCLOBClient sets the CLOB client for order execution
+func (e *Engine) SetCLOBClient(client *CLOBClient) {
+	e.clobClient = client
+	log.Info().Msg("🔗 CLOB client connected to engine")
 }
 
 // SetConfig updates engine configuration
@@ -280,6 +287,11 @@ func (e *Engine) oddsRefreshLoop() {
 func (e *Engine) updateWindowStates() {
 	windows := e.windowScanner.GetActiveWindows()
 	currentBTC := e.binanceClient.GetCurrentPrice()
+
+	log.Debug().
+		Int("active_windows", len(windows)).
+		Str("btc_price", currentBTC.String()).
+		Msg("📊 Window state update")
 
 	e.windowsMu.Lock()
 	defer e.windowsMu.Unlock()
@@ -543,16 +555,53 @@ func (e *Engine) executeTrade(opp Opportunity, state *WindowState) *Trade {
 		EnteredAt:      time.Now(),
 	}
 
-	// TODO: Implement actual CLOB order placement here
-	// For now, just log and track
+	// Determine which token to buy (YES=Up, NO=Down)
+	var tokenID string
+	if opp.Direction == "UP" {
+		tokenID = opp.Window.YesTokenID
+	} else {
+		tokenID = opp.Window.NoTokenID
+	}
+
+	// Calculate size: $amount / price = shares
+	// E.g., $1 / 0.45 = 2.22 shares
+	shares := e.positionSize.Div(opp.MarketOdds).Round(2)
+
 	log.Info().
 		Str("direction", trade.Direction).
 		Str("entry_price", trade.EntryPrice.String()).
 		Str("amount", trade.Amount.String()).
+		Str("shares", shares.String()).
 		Str("btc_move", trade.PriceChangePct.String()+"%").
 		Str("edge", trade.Edge.Mul(decimal.NewFromInt(100)).String()+"%").
 		Str("window", truncate(trade.Question, 40)).
-		Msg("⚡ ARBITRAGE TRADE")
+		Msg("⚡ ARBITRAGE TRADE SIGNAL")
+
+	// Execute actual trade if CLOB client is available
+	if e.clobClient != nil && tokenID != "" {
+		orderResp, err := e.clobClient.PlaceMarketBuy(tokenID, shares)
+		if err != nil {
+			log.Error().
+				Err(err).
+				Str("token", tokenID).
+				Str("shares", shares.String()).
+				Msg("❌ Order placement failed")
+			trade.Status = "failed"
+		} else {
+			log.Info().
+				Str("order_id", orderResp.OrderID).
+				Str("status", orderResp.Status).
+				Msg("✅ Order placed successfully")
+			trade.ID = orderResp.OrderID
+			trade.Status = "filled"
+		}
+	} else if e.clobClient == nil {
+		log.Warn().Msg("⚠️ CLOB client not connected - trade simulated only")
+		trade.Status = "simulated"
+	} else {
+		log.Warn().Str("direction", opp.Direction).Msg("⚠️ No token ID for direction - trade skipped")
+		trade.Status = "skipped"
+	}
 
 	// Track trade
 	e.tradesMu.Lock()

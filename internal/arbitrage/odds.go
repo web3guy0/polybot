@@ -15,13 +15,19 @@ import (
 	"github.com/shopspring/decimal"
 )
 
+// CLOBBookEntry represents a single bid/ask entry
+type CLOBBookEntry struct {
+	Price string `json:"price"`
+	Size  string `json:"size"`
+}
+
 // CLOBBook represents the order book from Polymarket CLOB
 type CLOBBook struct {
-	Market   string     `json:"market"`
-	AssetID  string     `json:"asset_id"`
-	Bids     [][]string `json:"bids"` // [[price, size], ...]
-	Asks     [][]string `json:"asks"`
-	Hash     string     `json:"hash"`
+	Market   string          `json:"market"`
+	AssetID  string          `json:"asset_id"`
+	Bids     []CLOBBookEntry `json:"bids"`
+	Asks     []CLOBBookEntry `json:"asks"`
+	Hash     string          `json:"hash"`
 }
 
 // LiveOdds represents current tradeable odds for a market
@@ -78,14 +84,14 @@ func (f *OddsFetcher) GetLiveOdds(tokenID string) (*LiveOdds, error) {
 
 	// Parse best bid (highest buy order)
 	if len(book.Bids) > 0 {
-		odds.BestBid, _ = decimal.NewFromString(book.Bids[0][0])
-		odds.BidSize, _ = decimal.NewFromString(book.Bids[0][1])
+		odds.BestBid, _ = decimal.NewFromString(book.Bids[0].Price)
+		odds.BidSize, _ = decimal.NewFromString(book.Bids[0].Size)
 	}
 
 	// Parse best ask (lowest sell order)
 	if len(book.Asks) > 0 {
-		odds.BestAsk, _ = decimal.NewFromString(book.Asks[0][0])
-		odds.AskSize, _ = decimal.NewFromString(book.Asks[0][1])
+		odds.BestAsk, _ = decimal.NewFromString(book.Asks[0].Price)
+		odds.AskSize, _ = decimal.NewFromString(book.Asks[0].Size)
 	}
 
 	// Calculate spread

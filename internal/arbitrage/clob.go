@@ -389,40 +389,125 @@ func (c *CLOBClient) PlaceOrder(order Order) (*OrderResponse, error) {
 	return &orderResp, nil
 }
 
-// PlaceMarketBuy places a market buy order (uses best ask)
+// PlaceMarketBuy places a market buy order using native Go EIP-712 signing
 func (c *CLOBClient) PlaceMarketBuy(tokenID string, size decimal.Decimal) (*OrderResponse, error) {
-	// Get current best ask
+	return c.placeOrder(tokenID, SideBuy, size)
+}
+
+// PlaceMarketSell places a market sell order using native Go EIP-712 signing
+func (c *CLOBClient) PlaceMarketSell(tokenID string, size decimal.Decimal) (*OrderResponse, error) {
+	return c.placeOrder(tokenID, SideSell, size)
+}
+
+// placeOrder places an order using native Go EIP-712 signing (fast!)
+func (c *CLOBClient) placeOrder(tokenID string, side int, size decimal.Decimal) (*OrderResponse, error) {
+	start := time.Now()
+
+	// Get current best price for order
 	fetcher := NewOddsFetcher()
 	odds, err := fetcher.GetLiveOdds(tokenID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get odds: %w", err)
 	}
 
-	// Add 1% slippage to best ask to ensure fill
-	slippage := decimal.NewFromFloat(0.01)
-	maxPrice := odds.BestAsk.Add(slippage)
-
-	// Cap at 0.99 (never pay more than 99 cents)
-	if maxPrice.GreaterThan(decimal.NewFromFloat(0.99)) {
-		maxPrice = decimal.NewFromFloat(0.99)
+	var price decimal.Decimal
+	if side == SideBuy {
+		// Add 2% slippage to best ask to ensure fill
+		slippage := decimal.NewFromFloat(0.02)
+		price = odds.BestAsk.Add(slippage)
+		// Cap at 0.99 (never pay more than 99 cents)
+		if price.GreaterThan(decimal.NewFromFloat(0.99)) {
+			price = decimal.NewFromFloat(0.99)
+		}
+	} else {
+		// Subtract 2% from best bid for sells
+		slippage := decimal.NewFromFloat(0.02)
+		price = odds.BestBid.Sub(slippage)
+		// Floor at 0.01 (never sell for less than 1 cent)
+		if price.LessThan(decimal.NewFromFloat(0.01)) {
+			price = decimal.NewFromFloat(0.01)
+		}
 	}
 
-	order := Order{
-		TokenID:   tokenID,
-		Price:     maxPrice,
-		Size:      size,
-		Side:      OrderSideBuy,
-		OrderType: OrderTypeFOK,
+	// Create order signer
+	signer := NewOrderSigner(c.privateKey, c.address, c.funderAddress, c.signatureType)
+
+	// Create and sign order
+	signedOrder, err := signer.CreateSignedOrder(tokenID, side, price, size)
+	if err != nil {
+		return nil, fmt.Errorf("failed to sign order: %w", err)
+	}
+
+	// Log timing
+	signTime := time.Since(start)
+
+	sideStr := "BUY"
+	if side == SideSell {
+		sideStr = "SELL"
 	}
 
 	log.Info().
-		Str("token", tokenID).
+		Str("token", tokenID[:20]+"...").
+		Str("side", sideStr).
 		Str("size", size.String()).
-		Str("max_price", maxPrice.String()).
-		Str("best_ask", odds.BestAsk.String()).
-		Msg("📝 Placing market buy order")
+		Str("price", price.String()).
+		Dur("sign_time_ms", signTime).
+		Msg("⚡ Order signed (native Go)")
 
-	return c.PlaceOrder(order)
+	// Submit order to CLOB
+	return c.submitSignedOrder(signedOrder)
+}
+
+// submitSignedOrder posts a signed order to the CLOB API
+func (c *CLOBClient) submitSignedOrder(signedOrder *SignedCTFOrder) (*OrderResponse, error) {
+	start := time.Now()
+
+	// Build request payload
+	payload := signedOrder.ToAPIPayload()
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal order: %w", err)
+	}
+
+	// Create request
+	req, err := http.NewRequest("POST", c.baseURL+"/order", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+
+	// Add L2 auth headers
+	c.signL2Request(req, "POST", "/order", body)
+
+	// Execute request
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+
+	log.Debug().
+		Int("status", resp.StatusCode).
+		Dur("api_time_ms", time.Since(start)).
+		RawJSON("response", respBody).
+		Msg("CLOB API response")
+
+	var orderResp OrderResponse
+	if err := json.Unmarshal(respBody, &orderResp); err != nil {
+		return nil, fmt.Errorf("failed to parse response: %w, body: %s", err, string(respBody))
+	}
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		return &orderResp, fmt.Errorf("order failed: %s - %s", orderResp.ErrorCode, orderResp.Message)
+	}
+
+	log.Info().
+		Str("order_id", orderResp.OrderID).
+		Str("status", orderResp.Status).
+		Msg("✅ Order submitted successfully")
+
+	return &orderResp, nil
 }
 
 // CancelOrder cancels an open order

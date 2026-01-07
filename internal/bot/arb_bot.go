@@ -745,9 +745,8 @@ func (b *ArbBot) buildSettingsMessage() (string, tgbotapi.InlineKeyboardMarkup) 
 	modeBtn := "🔴 Go LIVE"
 	if isLive {
 		modeEmoji = "🔴"
-		modeText := "LIVE"
+		modeText = "LIVE"
 		modeBtn = "🧪 Go DRY"
-		_ = modeText
 	}
 
 	alertEmoji := "🔔"
@@ -1298,8 +1297,7 @@ func (b *ArbBot) sendStartupMessage() {
 	modeText := "DRY RUN"
 	if isLive {
 		modeEmoji = "🔴"
-		modeText := "LIVE"
-		_ = modeText
+		modeText = "LIVE"
 	}
 
 	text := fmt.Sprintf(`⚡ *Polybot v4.0 Started*

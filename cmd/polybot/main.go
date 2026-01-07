@@ -89,14 +89,7 @@ func main() {
 	windowScanner.Start()
 	log.Info().Str("asset", asset).Msg("🔍 Window scanner started")
 
-	// 3. Arbitrage engine - the money maker
-	arbEngine := arbitrage.NewEngine(cfg, binanceClient, windowScanner)
-
-	// Start the arbitrage engine
-	arbEngine.Start()
-	log.Info().Msg("⚡ Arbitrage engine started")
-
-	// 4. CLOB client - for account/positions data
+	// 3. CLOB client - for trading and account data
 	// Works with either: API credentials OR wallet private key (will derive creds)
 	var clobClient *arbitrage.CLOBClient
 	if cfg.WalletPrivateKey != "" || (cfg.CLOBApiKey != "" && cfg.CLOBApiSecret != "") {
@@ -110,13 +103,25 @@ func main() {
 			cfg.SignatureType,
 		)
 		if err != nil {
-			log.Warn().Err(err).Msg("⚠️ Failed to initialize CLOB client - account features disabled")
+			log.Warn().Err(err).Msg("⚠️ Failed to initialize CLOB client - trading disabled")
 		} else {
 			log.Info().Msg("💳 CLOB client initialized")
 		}
 	} else {
-		log.Warn().Msg("⚠️ No wallet private key - add WALLET_PRIVATE_KEY to .env for account features")
+		log.Warn().Msg("⚠️ No credentials - add CLOB_API_KEY/SECRET to .env for trading")
 	}
+
+	// 4. Arbitrage engine - the money maker
+	arbEngine := arbitrage.NewEngine(cfg, binanceClient, windowScanner)
+
+	// Connect CLOB client to engine for order execution
+	if clobClient != nil {
+		arbEngine.SetCLOBClient(clobClient)
+	}
+
+	// Start the arbitrage engine
+	arbEngine.Start()
+	log.Info().Msg("⚡ Arbitrage engine started")
 
 	// ====== TELEGRAM BOT ======
 	telegramBot, err := bot.NewArbBot(cfg, db, binanceClient, windowScanner, arbEngine, clobClient)
