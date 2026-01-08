@@ -27,6 +27,7 @@ import (
 	"github.com/web3guy0/polybot/internal/binance"
 	"github.com/web3guy0/polybot/internal/bot"
 	"github.com/web3guy0/polybot/internal/chainlink"
+	"github.com/web3guy0/polybot/internal/cmc"
 	"github.com/web3guy0/polybot/internal/config"
 	"github.com/web3guy0/polybot/internal/database"
 	"github.com/web3guy0/polybot/internal/polymarket"
@@ -98,7 +99,12 @@ func main() {
 	windowScanner.Start()
 	log.Info().Str("asset", asset).Msg("🔍 Window scanner started")
 
-	// 3. CLOB client - for trading and account data
+	// 4. CMC client - fast price updates, same source as Polymarket Data Streams!
+	cmcClient := cmc.NewClient()
+	cmcClient.Start()
+	log.Info().Msg("📊 CMC price feed started (1s updates)")
+
+	// 5. CLOB client - for trading and account data
 	// Works with either: API credentials OR wallet private key (will derive creds)
 	var clobClient *arbitrage.CLOBClient
 	if cfg.WalletPrivateKey != "" || (cfg.CLOBApiKey != "" && cfg.CLOBApiSecret != "") {
@@ -120,8 +126,8 @@ func main() {
 		log.Warn().Msg("⚠️ No credentials - add CLOB_API_KEY/SECRET to .env for trading")
 	}
 
-	// 4. Arbitrage engine - the money maker
-	arbEngine := arbitrage.NewEngine(cfg, binanceClient, chainlinkClient, windowScanner)
+	// 6. Arbitrage engine - the money maker
+	arbEngine := arbitrage.NewEngine(cfg, binanceClient, chainlinkClient, cmcClient, windowScanner)
 
 	// Connect CLOB client to engine for order execution
 	if clobClient != nil {
@@ -146,16 +152,15 @@ func main() {
 	log.Info().Msg("╔══════════════════════════════════════════╗")
 	log.Info().Msg("║     LATENCY ARBITRAGE MODE ACTIVE        ║")
 	log.Info().Msg("║                                          ║")
-	log.Info().Msg("║  Strategy: Exploit Binance→Polymarket    ║")
-	log.Info().Msg("║            information lag               ║")
+	log.Info().Msg("║  Strategy: Exploit price→odds lag       ║")
 	log.Info().Msg("║                                          ║")
-	log.Info().Msg("║  BTC moves on Binance                    ║")
+	log.Info().Msg("║  BTC moves on CMC/Chainlink              ║")
 	log.Info().Msg("║  → Polymarket odds stale                 ║")
 	log.Info().Msg("║  → Buy mispriced outcome                 ║")
 	log.Info().Msg("║  → Exit at 75¢ OR hold to resolution     ║")
 	log.Info().Msg("║                                          ║")
 	log.Info().Msg("║  Price Sources:                          ║")
-	log.Info().Msg("║  📈 Binance (fast detection)             ║")
+	log.Info().Msg("║  📊 CMC (1s updates, same as DataStreams)║")
 	log.Info().Msg("║  ⛓️ Chainlink (resolution oracle)        ║")
 	log.Info().Msg("╚══════════════════════════════════════════╝")
 	log.Info().Msg("")

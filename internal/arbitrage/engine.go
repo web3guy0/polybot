@@ -1,12 +1,12 @@
 // Package arbitrage provides latency arbitrage functionality for Polymarket
 //
-// engine.go - Core arbitrage engine that exploits the lag between Binance price
-// movements and Polymarket odds updates. When BTC moves on Binance but Polymarket
+// engine.go - Core arbitrage engine that exploits the lag between price
+// movements and Polymarket odds updates. When BTC moves but Polymarket
 // odds haven't caught up, we buy the mispriced outcome.
 //
 // Strategy:
-// 1. Track window start price from Polymarket
-// 2. Monitor real-time BTC price from Binance WebSocket
+// 1. Track window start price from Chainlink on-chain
+// 2. Monitor real-time BTC price from CMC (same source as Polymarket!)
 // 3. Detect significant price moves (>0.2% default)
 // 4. Check if Polymarket odds are stale (still ~50/50)
 // 5. Calculate edge: if expected value is positive, execute
@@ -24,6 +24,7 @@ import (
 
 	"github.com/web3guy0/polybot/internal/binance"
 	"github.com/web3guy0/polybot/internal/chainlink"
+	"github.com/web3guy0/polybot/internal/cmc"
 	"github.com/web3guy0/polybot/internal/config"
 	"github.com/web3guy0/polybot/internal/polymarket"
 )
@@ -94,6 +95,7 @@ type Engine struct {
 	cfg             *config.Config
 	binanceClient   *binance.Client
 	chainlinkClient *chainlink.Client // Chainlink price feed (what Polymarket uses for resolution)
+	cmcClient       *cmc.Client       // CMC price feed (fast updates, same source as Data Streams!)
 	windowScanner   *polymarket.WindowScanner
 	clobClient      *CLOBClient // CLOB trading client
 
@@ -154,12 +156,13 @@ type EngineConfig struct {
 }
 
 // NewEngine creates a new arbitrage engine
-// Optimized for PurpleThunder strategy: buy at 40-50¢, exit at 70-80¢ or hold to resolution
-func NewEngine(cfg *config.Config, bc *binance.Client, cl *chainlink.Client, ws *polymarket.WindowScanner) *Engine {
+// Uses CMC for fast price detection (same source as Polymarket Data Streams!)
+func NewEngine(cfg *config.Config, bc *binance.Client, cl *chainlink.Client, cmcCl *cmc.Client, ws *polymarket.WindowScanner) *Engine {
 	e := &Engine{
 		cfg:              cfg,
 		binanceClient:    bc,
 		chainlinkClient:  cl,
+		cmcClient:        cmcCl,
 		windowScanner:    ws,
 		windowStates:     make(map[string]*WindowState),
 		openPositions:    make(map[string]*OpenPosition),
@@ -351,13 +354,21 @@ func (e *Engine) logStatus() {
 	e.windowsMu.RLock()
 	defer e.windowsMu.RUnlock()
 
-	// Use Chainlink price (same source as start price for consistency!)
+	// Use CMC price (fastest, same source as Data Streams!)
 	var currentPrice decimal.Decimal
-	if e.chainlinkClient != nil {
+	var priceSource string
+	
+	if e.cmcClient != nil && !e.cmcClient.IsStale() {
+		currentPrice = e.cmcClient.GetCurrentPrice()
+		priceSource = "CMC"
+	}
+	if currentPrice.IsZero() && e.chainlinkClient != nil {
 		currentPrice = e.chainlinkClient.GetCurrentPrice()
+		priceSource = "Chainlink"
 	}
 	if currentPrice.IsZero() {
 		currentPrice = e.binanceClient.GetCurrentPrice()
+		priceSource = "Binance"
 	}
 	binancePrice := e.binanceClient.GetCurrentPrice()
 
@@ -398,7 +409,8 @@ func (e *Engine) logStatus() {
 			Str("direction", direction).
 			Str("btc_move", priceChangePct.StringFixed(3)+"%").
 			Str("min_move", minMovePct.StringFixed(1)+"%").
-			Str("chainlink", currentPrice.StringFixed(2)).
+			Str("price", currentPrice.StringFixed(2)).
+			Str("source", priceSource).
 			Str("binance", binancePrice.StringFixed(2)).
 			Str("spread", binancePrice.Sub(currentPrice).StringFixed(2)).
 			Str("up_odds", state.CurrentUpOdds.String()).
@@ -752,15 +764,21 @@ func (e *Engine) refreshOdds() {
 
 // checkOpportunities scans for arbitrage opportunities
 func (e *Engine) checkOpportunities() {
-	// ⚡ CRITICAL: Use Chainlink on-chain for current price to match start price source!
-	// Polymarket uses Chainlink Data Streams for resolution.
-	// Chainlink on-chain is ~$20-30 off but CONSISTENT with our start price.
-	// Binance is ~$30-50 off from Data Streams, causing direction mismatches.
+	// ⚡ PRIORITY ORDER for current price:
+	// 1. CMC - Updates every 1s, same source as Polymarket Data Streams (~$1 diff)
+	// 2. Chainlink on-chain - Updates every 20-60s, ~$1 diff from Data Streams
+	// 3. Binance - Fast but ~$80 diff from Data Streams (direction mismatch!)
 	var currentBTC decimal.Decimal
-	if e.chainlinkClient != nil {
+	
+	// Try CMC first (fastest + most accurate)
+	if e.cmcClient != nil && !e.cmcClient.IsStale() {
+		currentBTC = e.cmcClient.GetCurrentPrice()
+	}
+	// Fallback to Chainlink on-chain
+	if currentBTC.IsZero() && e.chainlinkClient != nil {
 		currentBTC = e.chainlinkClient.GetCurrentPrice()
 	}
-	// Fallback to Binance if Chainlink unavailable
+	// Last resort: Binance (less accurate but always available)
 	if currentBTC.IsZero() {
 		currentBTC = e.binanceClient.GetCurrentPrice()
 	}
