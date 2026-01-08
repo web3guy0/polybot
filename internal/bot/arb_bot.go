@@ -2,6 +2,7 @@
 //
 // arb_bot.go - Modern Telegram bot for latency arbitrage trading
 // Features: Inline keyboards, real-time stats, trade controls, settings management
+// Supports: Multi-asset (BTC, ETH, SOL), CMC pricing, dynamic position sizing
 package bot
 
 import (
@@ -16,6 +17,7 @@ import (
 
 	"github.com/web3guy0/polybot/internal/arbitrage"
 	"github.com/web3guy0/polybot/internal/binance"
+	"github.com/web3guy0/polybot/internal/cmc"
 	"github.com/web3guy0/polybot/internal/config"
 	"github.com/web3guy0/polybot/internal/database"
 	"github.com/web3guy0/polybot/internal/polymarket"
@@ -53,8 +55,10 @@ type ArbBot struct {
 	cfg           *config.Config
 	db            *database.Database
 	binanceClient *binance.Client
+	cmcClient     *cmc.Client // Multi-asset price feed
 	windowScanner *polymarket.WindowScanner
 	arbEngine     *arbitrage.Engine
+	allEngines    []*arbitrage.Engine // All asset engines for multi-asset view
 	clobClient    *arbitrage.CLOBClient
 
 	// Runtime state (can be toggled via bot)
@@ -132,6 +136,45 @@ func (b *ArbBot) Stop() {
 	close(b.stopCh)
 }
 
+// SetCMCClient sets the CMC client for multi-asset pricing
+func (b *ArbBot) SetCMCClient(client *cmc.Client) {
+	b.cmcClient = client
+}
+
+// SetAllEngines sets all arbitrage engines and configures callbacks for each
+func (b *ArbBot) SetAllEngines(engines []*arbitrage.Engine) {
+	b.allEngines = engines
+	
+	// Set up callbacks for ALL engines (not just primary)
+	for _, engine := range engines {
+		asset := engine.GetAsset()
+		
+		// Opportunity callback (rate limited)
+		engine.SetOpportunityCallback(func(opp arbitrage.Opportunity) {
+			b.stateMu.RLock()
+			alertsOn := b.alertsOn
+			b.stateMu.RUnlock()
+
+			if alertsOn && time.Since(b.lastOppAlert) > 30*time.Second {
+				b.sendOpportunityAlert(b.cfg.TelegramChatID, opp)
+				b.lastOppAlert = time.Now()
+			}
+		})
+		
+		// Trade callback - always fire AND save to database
+		engine.SetTradeCallback(func(trade arbitrage.Trade) {
+			// Send Telegram alert
+			b.sendTradeAlert(b.cfg.TelegramChatID, trade)
+			b.lastTradeAlert = time.Now()
+			
+			// Save to database
+			b.saveArbTradeToDb(trade, asset)
+		})
+		
+		log.Debug().Str("asset", asset).Msg("📊 Callbacks configured for engine")
+	}
+}
+
 func (b *ArbBot) listenForUpdates() {
 	u := tgbotapi.NewUpdate(0)
 	u.Timeout = 60
@@ -195,6 +238,10 @@ func (b *ArbBot) handleMessage(msg *tgbotapi.Message) {
 		b.cmdSettings(chatID)
 	case "live":
 		b.cmdToggleLive(chatID)
+	case "all":
+		b.cmdAllAssets(chatID)
+	case "config", "cfg":
+		b.cmdConfig(chatID)
 	case "help", "h":
 		b.cmdHelp(chatID)
 	default:
@@ -253,6 +300,16 @@ func (b *ArbBot) handleCallback(cb *tgbotapi.CallbackQuery) {
 		b.setPositionSize(chatID, msgID, 50)
 	case cbSetSize100:
 		b.setPositionSize(chatID, msgID, 100)
+	case cbShowAll:
+		b.updateAllAssetsMessage(chatID, msgID)
+	case cbShowBTC:
+		b.updateAssetMessage(chatID, msgID, "BTC")
+	case cbShowETH:
+		b.updateAssetMessage(chatID, msgID, "ETH")
+	case cbShowSOL:
+		b.updateAssetMessage(chatID, msgID, "SOL")
+	case cbShowConfig:
+		b.updateConfigMessage(chatID, msgID)
 	}
 }
 
@@ -262,17 +319,20 @@ func (b *ArbBot) cmdStart(chatID int64) {
 	msg := `⚡ *POLYBOT v4.0*
 ━━━━━━━━━━━━━━━━━━━━━
 
-Latency Arbitrage Bot for Polymarket
+Multi-Asset Latency Arbitrage Bot
 
-*Strategy:*
-BTC moves on Binance → Polymarket odds lag → Buy the winner → Collect $1
+*Assets:* BTC • ETH • SOL
+*Strategy:* Price moves → Odds stale → Buy winner → $1
+
+*Features:*
+• 🚀 Dynamic sizing (1x/2x/3x)
+• 📊 CMC price feed (1s updates)
+• 🛑 20% stop-loss protection
 
 *Quick Commands:*
 /menu - Main menu
-/status - System status  
-/price - BTC price
-/opps - Opportunities
-/settings - Configure
+/all - All assets status
+/config - View settings
 
 ━━━━━━━━━━━━━━━━━━━━━
 💡 Tap /menu to get started`
@@ -320,11 +380,11 @@ func (b *ArbBot) cmdMenu(chatID int64) {
 			tgbotapi.NewInlineKeyboardButtonData("⚡ Opps", cbRefreshOpps),
 		),
 		tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("� Account", cbRefreshAccount),
+			tgbotapi.NewInlineKeyboardButtonData("👛 Account", cbRefreshAccount),
 			tgbotapi.NewInlineKeyboardButtonData("📦 Positions", cbRefreshPositions),
 		),
 		tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("📜 History", cbRefreshHistory),
+			tgbotapi.NewInlineKeyboardButtonData("🌐 All Assets", cbShowAll),
 			tgbotapi.NewInlineKeyboardButtonData("📈 Stats", cbRefreshStats),
 		),
 		tgbotapi.NewInlineKeyboardRow(
@@ -437,7 +497,11 @@ func (b *ArbBot) cmdHelp(chatID int64) {
 *Navigation:*
 /menu - Main menu with buttons
 /status - System health
-/price - BTC price & change
+/price - Current prices
+
+*Multi-Asset:*
+/all - All assets (BTC/ETH/SOL)
+/config - View configuration
 
 *Trading:*
 /opps - Active opportunities
@@ -474,26 +538,59 @@ func (b *ArbBot) buildStatusMessage() (string, tgbotapi.InlineKeyboardMarkup) {
 	posSize := b.positionSize
 	b.stateMu.RUnlock()
 
-	btcPrice := b.binanceClient.GetCurrentPrice()
-	connected := b.binanceClient.IsConnected()
-	windows := len(b.windowScanner.GetActiveWindows())
+	// Get BTC price from CMC first, fallback to Binance
+	var btcPrice decimal.Decimal
+	priceSource := "CMC"
+	if b.cmcClient != nil {
+		btcPrice = b.cmcClient.GetAssetPrice("BTC")
+	}
+	if btcPrice.IsZero() {
+		btcPrice = b.binanceClient.GetCurrentPrice()
+		priceSource = "Binance"
+	}
+	
+	connected := !btcPrice.IsZero()
+	
+	// Count all active windows across engines
+	totalWindows := 0
+	for _, engine := range b.allEngines {
+		if engine != nil {
+			stats := engine.GetStats()
+			if v, ok := stats["active_windows"]; ok {
+				totalWindows += v.(int)
+			}
+		}
+	}
+	if totalWindows == 0 {
+		totalWindows = len(b.windowScanner.GetActiveWindows())
+	}
+	
 	stats := b.arbEngine.GetStats()
 
 	modeEmoji := "🧪"
 	modeText := "DRY RUN"
 	if isLive {
 		modeEmoji = "🔴"
-		modeText = "LIVE"
+		modeText := "LIVE"
+		_ = modeText
 	}
 
 	connEmoji := "🟢"
-	if !connected || btcPrice.IsZero() {
+	if !connected {
 		connEmoji = "🔴"
 	}
 
 	alertEmoji := "🔔"
 	if !alertsOn {
 		alertEmoji = "🔕"
+	}
+
+	// Count active engines
+	activeEngines := 0
+	for _, engine := range b.allEngines {
+		if engine != nil {
+			activeEngines++
+		}
 	}
 
 	text := fmt.Sprintf(`📊 *System Status*
@@ -503,11 +600,12 @@ func (b *ArbBot) buildStatusMessage() (string, tgbotapi.InlineKeyboardMarkup) {
 *Alerts:* %s %s
 *Position Size:* $%s
 
-*Connection:*
-%s Binance: $%s
+*Price Feed:*
+%s %s: $%s
 
 *Markets:*
-🎯 Windows: %d active
+🌐 Active Engines: %d
+🎯 Windows: %d
 ⚡ Opportunities: %v
 
 *Performance:*
@@ -525,8 +623,9 @@ func (b *ArbBot) buildStatusMessage() (string, tgbotapi.InlineKeyboardMarkup) {
 			return "OFF"
 		}(),
 		posSize.StringFixed(0),
-		connEmoji, btcPrice.StringFixed(0),
-		windows,
+		connEmoji, priceSource, btcPrice.StringFixed(0),
+		activeEngines,
+		totalWindows,
 		stats["active_windows"],
 		stats["total_trades"],
 		stats["win_rate"],
@@ -537,9 +636,10 @@ func (b *ArbBot) buildStatusMessage() (string, tgbotapi.InlineKeyboardMarkup) {
 	keyboard := tgbotapi.NewInlineKeyboardMarkup(
 		tgbotapi.NewInlineKeyboardRow(
 			tgbotapi.NewInlineKeyboardButtonData("🔄 Refresh", cbRefreshStatus),
-			tgbotapi.NewInlineKeyboardButtonData("⚙️ Settings", cbShowSettings),
+			tgbotapi.NewInlineKeyboardButtonData("🌐 All Assets", cbShowAll),
 		),
 		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("⚙️ Settings", cbShowSettings),
 			tgbotapi.NewInlineKeyboardButtonData("◀️ Menu", cbShowMain),
 		),
 	)
@@ -548,10 +648,26 @@ func (b *ArbBot) buildStatusMessage() (string, tgbotapi.InlineKeyboardMarkup) {
 }
 
 func (b *ArbBot) buildPriceMessage() (string, tgbotapi.InlineKeyboardMarkup) {
-	btcPrice := b.binanceClient.GetCurrentPrice()
+	// Use CMC for all prices (more accurate than Binance)
+	var btcPrice, ethPrice, solPrice decimal.Decimal
+	priceSource := "CMC"
+	
+	if b.cmcClient != nil {
+		btcPrice = b.cmcClient.GetAssetPrice("BTC")
+		ethPrice = b.cmcClient.GetAssetPrice("ETH")
+		solPrice = b.cmcClient.GetAssetPrice("SOL")
+	}
+	
+	// Fallback to Binance for BTC only
+	if btcPrice.IsZero() {
+		btcPrice = b.binanceClient.GetCurrentPrice()
+		priceSource = "Binance"
+	}
+
+	// Get change from Binance (still useful for trend)
 	change1m, changePct1m := b.binanceClient.GetPriceChange(1 * time.Minute)
 	change5m, changePct5m := b.binanceClient.GetPriceChange(5 * time.Minute)
-	change15m, changePct15m := b.binanceClient.GetPriceChange(15 * time.Minute)
+	_, changePct15m := b.binanceClient.GetPriceChange(15 * time.Minute)
 
 	getArrow := func(pct decimal.Decimal) string {
 		if pct.IsPositive() {
@@ -562,37 +678,37 @@ func (b *ArbBot) buildPriceMessage() (string, tgbotapi.InlineKeyboardMarkup) {
 		return "➡️"
 	}
 
-	text := fmt.Sprintf(`💰 *BTC Price*
-━━━━━━━━━━━━━━━━━━━━━
-
-*Current:* $%s
-
-*Changes:*
-%s 1m:  %s%% ($%s)
-%s 5m:  %s%% ($%s)
-%s 15m: %s%% ($%s)
-
-━━━━━━━━━━━━━━━━━━━━━
-📡 Binance WebSocket
-🕐 %s`,
-		btcPrice.StringFixed(2),
-		getArrow(changePct1m), changePct1m.StringFixed(3), change1m.Abs().StringFixed(0),
-		getArrow(changePct5m), changePct5m.StringFixed(3), change5m.Abs().StringFixed(0),
-		getArrow(changePct15m), changePct15m.StringFixed(3), change15m.Abs().StringFixed(0),
-		time.Now().Format("15:04:05"),
-	)
+	var sb strings.Builder
+	sb.WriteString("💰 *Crypto Prices*\n━━━━━━━━━━━━━━━━━━━━━\n\n")
+	
+	sb.WriteString(fmt.Sprintf("*₿ BTC:* $%s\n", btcPrice.StringFixed(0)))
+	if !ethPrice.IsZero() {
+		sb.WriteString(fmt.Sprintf("*Ξ ETH:* $%s\n", ethPrice.StringFixed(2)))
+	}
+	if !solPrice.IsZero() {
+		sb.WriteString(fmt.Sprintf("*◎ SOL:* $%s\n", solPrice.StringFixed(2)))
+	}
+	
+	sb.WriteString("\n*BTC Changes:*\n")
+	sb.WriteString(fmt.Sprintf("%s 1m:  %s%% ($%s)\n", getArrow(changePct1m), changePct1m.StringFixed(3), change1m.Abs().StringFixed(0)))
+	sb.WriteString(fmt.Sprintf("%s 5m:  %s%% ($%s)\n", getArrow(changePct5m), changePct5m.StringFixed(3), change5m.Abs().StringFixed(0)))
+	sb.WriteString(fmt.Sprintf("%s 15m: %s%%\n", getArrow(changePct15m), changePct15m.StringFixed(3)))
+	
+	sb.WriteString("\n━━━━━━━━━━━━━━━━━━━━━\n")
+	sb.WriteString(fmt.Sprintf("📊 Source: %s\n", priceSource))
+	sb.WriteString(fmt.Sprintf("🕐 %s", time.Now().Format("15:04:05")))
 
 	keyboard := tgbotapi.NewInlineKeyboardMarkup(
 		tgbotapi.NewInlineKeyboardRow(
 			tgbotapi.NewInlineKeyboardButtonData("🔄 Refresh", cbRefreshPrice),
-			tgbotapi.NewInlineKeyboardButtonData("⚡ Opps", cbRefreshOpps),
+			tgbotapi.NewInlineKeyboardButtonData("🌐 All Assets", cbShowAll),
 		),
 		tgbotapi.NewInlineKeyboardRow(
 			tgbotapi.NewInlineKeyboardButtonData("◀️ Menu", cbShowMain),
 		),
 	)
 
-	return text, keyboard
+	return sb.String(), keyboard
 }
 
 func (b *ArbBot) buildWindowsMessage() (string, tgbotapi.InlineKeyboardMarkup) {
@@ -1300,12 +1416,28 @@ func (b *ArbBot) sendStartupMessage() {
 		modeText = "LIVE"
 	}
 
+	// Get assets from engines
+	var assets []string
+	for _, engine := range b.allEngines {
+		if engine != nil {
+			assets = append(assets, engine.GetAsset())
+		}
+	}
+	if len(assets) == 0 {
+		assets = []string{b.cfg.TradingAsset}
+	}
+
 	text := fmt.Sprintf(`⚡ *Polybot v4.0 Started*
 ━━━━━━━━━━━━━━━━━━━━━
 
 %s *Mode:* %s
 💵 *Size:* $%s/trade
-🎯 *Asset:* %s
+🌐 *Assets:* %s
+
+*Dynamic Sizing:*
+• 0.1-0.2%% → 1x
+• 0.2-0.3%% → 2x
+• >0.3%% → 3x
 
 _Monitoring for opportunities..._
 
@@ -1313,7 +1445,7 @@ _Monitoring for opportunities..._
 💡 /menu for controls`,
 		modeEmoji, modeText,
 		posSize.StringFixed(0),
-		b.cfg.TradingAsset,
+		strings.Join(assets, ", "),
 	)
 
 	b.sendMarkdown(b.cfg.TelegramChatID, text)
@@ -1347,6 +1479,55 @@ BTC: $%s → $%s
 	)
 
 	b.sendMarkdown(chatID, text)
+}
+
+// saveArbTradeToDb saves an arbitrage trade to the database
+func (b *ArbBot) saveArbTradeToDb(trade arbitrage.Trade, asset string) {
+	if b.db == nil {
+		return
+	}
+
+	// Determine size multiplier from amount
+	sizeMultiplier := "1x"
+	baseSize := b.cfg.ArbPositionSize
+	if !baseSize.IsZero() {
+		ratio := trade.Amount.Div(baseSize)
+		if ratio.GreaterThanOrEqual(decimal.NewFromFloat(2.5)) {
+			sizeMultiplier = "3x"
+		} else if ratio.GreaterThanOrEqual(decimal.NewFromFloat(1.5)) {
+			sizeMultiplier = "2x"
+		}
+	}
+
+	dbTrade := &database.ArbTrade{
+		ID:             trade.ID,
+		Asset:          asset,
+		WindowID:       trade.WindowID,
+		Question:       trade.Question,
+		Direction:      trade.Direction,
+		TokenID:        trade.TokenID,
+		EntryPrice:     trade.EntryPrice,
+		ExitPrice:      trade.ExitPrice,
+		Amount:         trade.Amount,
+		Shares:         trade.Shares,
+		BTCAtEntry:     trade.BTCAtEntry,
+		BTCAtStart:     trade.BTCAtStart,
+		PriceChangePct: trade.PriceChangePct,
+		Edge:           trade.Edge,
+		SizeMultiplier: sizeMultiplier,
+		Status:         trade.Status,
+		ExitType:       trade.ExitType,
+		Profit:         trade.Profit,
+		EnteredAt:      trade.EnteredAt,
+		ExitedAt:       trade.ExitedAt,
+		ResolvedAt:     trade.ResolvedAt,
+	}
+
+	if err := b.db.SaveArbTrade(dbTrade); err != nil {
+		log.Error().Err(err).Str("trade_id", trade.ID).Msg("Failed to save trade to database")
+	} else {
+		log.Debug().Str("trade_id", trade.ID).Str("asset", asset).Msg("💾 Trade saved to database")
+	}
 }
 
 func (b *ArbBot) sendTradeAlert(chatID int64, trade arbitrage.Trade) {
@@ -1416,4 +1597,21 @@ func truncateStr(s string, maxLen int) string {
 		return s
 	}
 	return s[:maxLen] + "..."
+}
+
+// ==================== MULTI-ASSET UPDATE HANDLERS ====================
+
+func (b *ArbBot) updateAllAssetsMessage(chatID int64, msgID int) {
+	text, keyboard := b.buildAllAssetsMessage()
+	b.editMessage(chatID, msgID, text, keyboard)
+}
+
+func (b *ArbBot) updateAssetMessage(chatID int64, msgID int, asset string) {
+	text, keyboard := b.buildAssetDetailMessage(asset)
+	b.editMessage(chatID, msgID, text, keyboard)
+}
+
+func (b *ArbBot) updateConfigMessage(chatID int64, msgID int) {
+	text, keyboard := b.buildConfigMessage()
+	b.editMessage(chatID, msgID, text, keyboard)
 }

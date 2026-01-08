@@ -1,11 +1,14 @@
-// Package cmc provides CoinMarketCap price feed
+// Package cmc provides CoinMarketCap price feed for multiple assets
 // CMC uses the same Chainlink aggregated data as Polymarket Data Streams
 // Updates faster than Chainlink on-chain (~1s vs ~30s)
+// Supports BTC, ETH, SOL for multi-asset arbitrage
 package cmc
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -23,27 +26,59 @@ type CMCResponse struct {
 	} `json:"data"`
 }
 
-// Client fetches BTC price from CoinMarketCap
-type Client struct {
-	httpClient   *http.Client
-	currentPrice decimal.Decimal
-	lastUpdate   time.Time
-	mu           sync.RWMutex
-	stopCh       chan struct{}
+// AssetPrice holds price data for a single asset
+type AssetPrice struct {
+	Price      decimal.Decimal
+	LastUpdate time.Time
 }
 
-// NewClient creates a new CMC client
-func NewClient() *Client {
+// Client fetches crypto prices from CoinMarketCap
+type Client struct {
+	httpClient *http.Client
+	assets     []string // Assets to track (e.g., ["bitcoin", "ethereum", "solana"])
+	prices     map[string]*AssetPrice
+	mu         sync.RWMutex
+	stopCh     chan struct{}
+}
+
+// Slug mappings for CMC API
+var slugMap = map[string]string{
+	"BTC": "bitcoin",
+	"ETH": "ethereum",
+	"SOL": "solana",
+}
+
+// NewClient creates a new CMC client for specific assets
+func NewClient(assets ...string) *Client {
+	if len(assets) == 0 {
+		assets = []string{"BTC"} // Default to BTC only
+	}
+	
+	// Convert to CMC slugs
+	slugs := make([]string, 0, len(assets))
+	for _, asset := range assets {
+		if slug, ok := slugMap[strings.ToUpper(asset)]; ok {
+			slugs = append(slugs, slug)
+		}
+	}
+	
 	return &Client{
 		httpClient: &http.Client{Timeout: 2 * time.Second},
+		assets:     slugs,
+		prices:     make(map[string]*AssetPrice),
 		stopCh:     make(chan struct{}),
 	}
 }
 
 // Start begins polling CMC for price updates
 func (c *Client) Start() {
-	// Fetch initial price
-	c.fetchPrice()
+	// Initialize price maps
+	for _, slug := range c.assets {
+		c.prices[slug] = &AssetPrice{}
+	}
+	
+	// Fetch initial prices
+	c.fetchPrices()
 
 	// Poll every 1 second for fast updates
 	go func() {
@@ -53,14 +88,16 @@ func (c *Client) Start() {
 		for {
 			select {
 			case <-ticker.C:
-				c.fetchPrice()
+				c.fetchPrices()
 			case <-c.stopCh:
 				return
 			}
 		}
 	}()
 
-	log.Info().Msg("📊 CMC client started (1s polling)")
+	log.Info().
+		Strs("assets", c.assets).
+		Msg("📊 CMC client started (1s polling)")
 }
 
 // Stop stops the client
@@ -68,9 +105,11 @@ func (c *Client) Stop() {
 	close(c.stopCh)
 }
 
-// fetchPrice gets current BTC price from CMC
-func (c *Client) fetchPrice() {
-	url := "https://api.coinmarketcap.com/data-api/v3/cryptocurrency/quote/latest?slug=bitcoin&convertId=2781"
+// fetchPrices gets current prices from CMC for all tracked assets
+func (c *Client) fetchPrices() {
+	// Build URL with all slugs
+	slugs := strings.Join(c.assets, ",")
+	url := fmt.Sprintf("https://api.coinmarketcap.com/data-api/v3/cryptocurrency/quote/latest?slug=%s&convertId=2781", slugs)
 	
 	resp, err := c.httpClient.Get(url)
 	if err != nil {
@@ -85,45 +124,108 @@ func (c *Client) fetchPrice() {
 		return
 	}
 
-	if len(data.Data) > 0 && len(data.Data[0].Quotes) > 0 {
-		price := decimal.NewFromFloat(data.Data[0].Quotes[0].Price)
-		
-		c.mu.Lock()
-		oldPrice := c.currentPrice
-		c.currentPrice = price
-		c.lastUpdate = time.Now()
-		c.mu.Unlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
-		// Log significant changes
-		if !oldPrice.IsZero() {
-			diff := price.Sub(oldPrice).Abs()
-			if diff.GreaterThan(decimal.NewFromFloat(10)) {
-				log.Debug().
-					Str("price", price.StringFixed(2)).
-					Str("change", diff.StringFixed(2)).
-					Msg("📊 CMC price update")
+	for _, asset := range data.Data {
+		if len(asset.Quotes) > 0 {
+			price := decimal.NewFromFloat(asset.Quotes[0].Price)
+			
+			// Map symbol back to slug
+			slug := ""
+			switch asset.Symbol {
+			case "BTC":
+				slug = "bitcoin"
+			case "ETH":
+				slug = "ethereum"
+			case "SOL":
+				slug = "solana"
+			}
+			
+			if slug != "" && c.prices[slug] != nil {
+				oldPrice := c.prices[slug].Price
+				c.prices[slug].Price = price
+				c.prices[slug].LastUpdate = time.Now()
+
+				// Log significant changes
+				if !oldPrice.IsZero() {
+					diff := price.Sub(oldPrice).Abs()
+					threshold := decimal.NewFromFloat(1) // $1 for BTC/ETH, will adjust for SOL
+					if slug == "solana" {
+						threshold = decimal.NewFromFloat(0.1) // $0.10 for SOL
+					}
+					if diff.GreaterThan(threshold) {
+						log.Debug().
+							Str("asset", asset.Symbol).
+							Str("price", price.StringFixed(2)).
+							Str("change", diff.StringFixed(2)).
+							Msg("📊 CMC price update")
+					}
+				}
 			}
 		}
 	}
 }
 
-// GetCurrentPrice returns the latest BTC price
+// GetCurrentPrice returns the latest BTC price (backward compatible)
 func (c *Client) GetCurrentPrice() decimal.Decimal {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.currentPrice
+	return c.GetAssetPrice("BTC")
 }
 
-// GetLastUpdate returns when price was last updated
+// GetAssetPrice returns the latest price for a specific asset
+func (c *Client) GetAssetPrice(asset string) decimal.Decimal {
+	slug, ok := slugMap[strings.ToUpper(asset)]
+	if !ok {
+		return decimal.Zero
+	}
+	
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	
+	if p, exists := c.prices[slug]; exists {
+		return p.Price
+	}
+	return decimal.Zero
+}
+
+// GetLastUpdate returns when BTC price was last updated (backward compatible)
 func (c *Client) GetLastUpdate() time.Time {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.lastUpdate
+	return c.GetAssetLastUpdate("BTC")
 }
 
-// IsStale returns true if price is older than 5 seconds
-func (c *Client) IsStale() bool {
+// GetAssetLastUpdate returns when a specific asset was last updated
+func (c *Client) GetAssetLastUpdate(asset string) time.Time {
+	slug, ok := slugMap[strings.ToUpper(asset)]
+	if !ok {
+		return time.Time{}
+	}
+	
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return time.Since(c.lastUpdate) > 5*time.Second
+	
+	if p, exists := c.prices[slug]; exists {
+		return p.LastUpdate
+	}
+	return time.Time{}
+}
+
+// IsStale returns true if BTC price is older than 5 seconds (backward compatible)
+func (c *Client) IsStale() bool {
+	return c.IsAssetStale("BTC")
+}
+
+// IsAssetStale returns true if asset price is older than 5 seconds
+func (c *Client) IsAssetStale(asset string) bool {
+	slug, ok := slugMap[strings.ToUpper(asset)]
+	if !ok {
+		return true
+	}
+	
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	
+	if p, exists := c.prices[slug]; exists {
+		return time.Since(p.LastUpdate) > 5*time.Second
+	}
+	return true
 }

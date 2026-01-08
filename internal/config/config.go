@@ -4,6 +4,7 @@ import (
 "fmt"
 "os"
 "strconv"
+"strings"
 "time"
 
 "github.com/shopspring/decimal"
@@ -15,8 +16,9 @@ type Config struct {
 TelegramToken  string
 TelegramChatID int64
 
-// Trading Asset
-TradingAsset string
+// Trading Asset(s)
+TradingAsset  string   // Single asset (backward compatible)
+TradingAssets []string // Multi-asset: BTC, ETH, SOL
 
 // Mode
 DryRun bool
@@ -65,9 +67,10 @@ cfg := &Config{
 TelegramToken: os.Getenv("TELEGRAM_BOT_TOKEN"),
 
 // Trading
-TradingAsset: getEnv("TRADING_ASSET", "BTC"),
-DryRun:       getEnvBool("DRY_RUN", true),
-Debug:        getEnvBool("DEBUG", false),
+TradingAsset:  getEnv("TRADING_ASSET", "BTC"),
+TradingAssets: getEnvStringSlice("TRADING_ASSETS", []string{}), // e.g., "BTC,ETH,SOL"
+DryRun:        getEnvBool("DRY_RUN", true),
+Debug:         getEnvBool("DEBUG", false),
 
 // Polymarket API
 PolymarketAPIURL:  getEnv("POLYMARKET_API_URL", "https://gamma-api.polymarket.com"),
@@ -99,11 +102,11 @@ SignatureType:    getEnvInt("SIGNATURE_TYPE", 0),
 		ArbExitOddsThreshold: getEnvDecimal("ARB_EXIT_ODDS", decimal.NewFromFloat(0.75)),       // Sell at 75¢+
 		ArbHoldThreshold:     getEnvDecimal("ARB_HOLD_THRESHOLD", decimal.NewFromFloat(0.005)), // 0.5% BTC confirms direction
 		ArbStopLossPct:       getEnvDecimal("ARB_STOP_LOSS", decimal.NewFromFloat(0.20)),       // 🛑 20% stop-loss
-		Bankroll:     getEnvDecimal("BANKROLL", decimal.NewFromFloat(1000)),
+		Bankroll:             getEnvDecimal("BANKROLL", decimal.NewFromFloat(1000)),
 
-// Database
-DatabasePath: getEnv("DATABASE_PATH", "data/polybot.db"),
-}
+		// Database - supports PostgreSQL URL or SQLite path
+		DatabasePath: getEnv("DATABASE_URL", getEnv("DATABASE_PATH", "data/polybot.db")),
+	}
 
 // Parse chat ID
 if chatID := os.Getenv("TELEGRAM_CHAT_ID"); chatID != "" {
@@ -163,4 +166,28 @@ return d
 }
 }
 return defaultValue
+}
+
+func getEnvStringSlice(key string, defaultValue []string) []string {
+if value := os.Getenv(key); value != "" {
+// Split by comma and trim whitespace
+parts := make([]string, 0)
+for _, part := range splitAndTrim(value, ",") {
+if part != "" {
+parts = append(parts, part)
+}
+}
+if len(parts) > 0 {
+return parts
+}
+}
+return defaultValue
+}
+
+func splitAndTrim(s, sep string) []string {
+parts := make([]string, 0)
+for _, p := range strings.Split(s, sep) {
+parts = append(parts, strings.TrimSpace(p))
+}
+return parts
 }

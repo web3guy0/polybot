@@ -55,17 +55,24 @@ func main() {
 		zerolog.SetGlobalLevel(zerolog.DebugLevel)
 	}
 
-	asset := cfg.TradingAsset
-	if asset == "" {
-		asset = "BTC"
+	// Multi-asset support: BTC, ETH, SOL
+	// Can be configured via TRADING_ASSETS="BTC,ETH,SOL" or defaults to BTC only
+	assets := cfg.TradingAssets
+	if len(assets) == 0 {
+		// Fallback to single asset config
+		asset := cfg.TradingAsset
+		if asset == "" {
+			asset = "BTC"
+		}
+		assets = []string{asset}
 	}
 
 	log.Info().
 		Str("version", version).
 		Str("mode", "latency_arbitrage").
-		Str("asset", asset).
+		Strs("assets", assets).
 		Bool("dry_run", cfg.DryRun).
-		Msg("⚡ Polybot Arbitrage starting...")
+		Msg("⚡ Polybot Multi-Asset Arbitrage starting...")
 
 	// Create context for graceful shutdown
 	ctx, cancel := context.WithCancel(context.Background())
@@ -79,7 +86,7 @@ func main() {
 
 	// ====== CORE COMPONENTS ======
 
-	// 1. Binance client - real-time BTC price feed
+	// 1. Binance client - real-time BTC price feed (still needed as fallback)
 	binanceClient := binance.NewClient()
 	if err := binanceClient.Start(); err != nil {
 		log.Fatal().Err(err).Msg("Failed to start Binance client")
@@ -89,23 +96,17 @@ func main() {
 	// 2. Chainlink client - BTC/USD price feed on Polygon (what Polymarket uses for resolution)
 	chainlinkClient := chainlink.NewClient()
 	if err := chainlinkClient.Start(); err != nil {
-		log.Warn().Err(err).Msg("⚠️ Failed to start Chainlink client - using Binance only")
+		log.Warn().Err(err).Msg("⚠️ Failed to start Chainlink client - using CMC/Binance only")
 	} else {
 		log.Info().Msg("⛓️ Chainlink price feed connected (Polygon)")
 	}
 
-	// 3. Window scanner - find active prediction windows
-	windowScanner := polymarket.NewWindowScanner(cfg.PolymarketAPIURL, asset)
-	windowScanner.Start()
-	log.Info().Str("asset", asset).Msg("🔍 Window scanner started")
-
-	// 4. CMC client - fast price updates, same source as Polymarket Data Streams!
-	cmcClient := cmc.NewClient()
+	// 3. CMC client - fast price updates for ALL assets (BTC, ETH, SOL)
+	cmcClient := cmc.NewClient(assets...)
 	cmcClient.Start()
-	log.Info().Msg("📊 CMC price feed started (1s updates)")
+	log.Info().Strs("assets", assets).Msg("📊 CMC price feed started (1s updates)")
 
-	// 5. CLOB client - for trading and account data
-	// Works with either: API credentials OR wallet private key (will derive creds)
+	// 4. CLOB client - for trading and account data (shared across all engines)
 	var clobClient *arbitrage.CLOBClient
 	if cfg.WalletPrivateKey != "" || (cfg.CLOBApiKey != "" && cfg.CLOBApiSecret != "") {
 		clobClient, err = arbitrage.NewCLOBClient(
@@ -126,23 +127,41 @@ func main() {
 		log.Warn().Msg("⚠️ No credentials - add CLOB_API_KEY/SECRET to .env for trading")
 	}
 
-	// 6. Arbitrage engine - the money maker
-	arbEngine := arbitrage.NewEngine(cfg, binanceClient, chainlinkClient, cmcClient, windowScanner)
-
-	// Connect CLOB client to engine for order execution
-	if clobClient != nil {
-		arbEngine.SetCLOBClient(clobClient)
+	// 5. Create window scanners and arbitrage engines for EACH asset
+	windowScanners := make([]*polymarket.WindowScanner, 0, len(assets))
+	arbEngines := make([]*arbitrage.Engine, 0, len(assets))
+	
+	for _, asset := range assets {
+		// Window scanner for this asset
+		scanner := polymarket.NewWindowScanner(cfg.PolymarketAPIURL, asset)
+		scanner.Start()
+		windowScanners = append(windowScanners, scanner)
+		log.Info().Str("asset", asset).Msg("🔍 Window scanner started")
+		
+		// Arbitrage engine for this asset
+		engine := arbitrage.NewEngine(cfg, binanceClient, chainlinkClient, cmcClient, scanner)
+		engine.SetAsset(asset) // Tell engine which asset it's tracking
+		if clobClient != nil {
+			engine.SetCLOBClient(clobClient)
+		}
+		engine.Start()
+		arbEngines = append(arbEngines, engine)
+		log.Info().Str("asset", asset).Msg("⚡ Arbitrage engine started")
 	}
 
-	// Start the arbitrage engine
-	arbEngine.Start()
-	log.Info().Msg("⚡ Arbitrage engine started")
+	// Use first engine as primary for Telegram bot (BTC typically)
+	primaryScanner := windowScanners[0]
+	primaryEngine := arbEngines[0]
 
 	// ====== TELEGRAM BOT ======
-	telegramBot, err := bot.NewArbBot(cfg, db, binanceClient, windowScanner, arbEngine, clobClient)
+	telegramBot, err := bot.NewArbBot(cfg, db, binanceClient, primaryScanner, primaryEngine, clobClient)
 	if err != nil {
 		log.Fatal().Err(err).Msg("Failed to initialize Telegram bot")
 	}
+	
+	// Set multi-asset support
+	telegramBot.SetCMCClient(cmcClient)
+	telegramBot.SetAllEngines(arbEngines)
 
 	go telegramBot.Start()
 
@@ -150,18 +169,16 @@ func main() {
 	log.Info().Msg("✅ All systems online")
 	log.Info().Msg("")
 	log.Info().Msg("╔══════════════════════════════════════════╗")
-	log.Info().Msg("║     LATENCY ARBITRAGE MODE ACTIVE        ║")
+	log.Info().Msg("║   MULTI-ASSET LATENCY ARBITRAGE ACTIVE   ║")
 	log.Info().Msg("║                                          ║")
 	log.Info().Msg("║  Strategy: Exploit price→odds lag       ║")
 	log.Info().Msg("║                                          ║")
-	log.Info().Msg("║  BTC moves on CMC/Chainlink              ║")
-	log.Info().Msg("║  → Polymarket odds stale                 ║")
-	log.Info().Msg("║  → Buy mispriced outcome                 ║")
+	log.Info().Msgf("║  Assets: %-32s ║", formatAssets(assets))
+	log.Info().Msg("║  → Watch for price moves on CMC          ║")
+	log.Info().Msg("║  → Buy stale Polymarket odds             ║")
 	log.Info().Msg("║  → Exit at 75¢ OR hold to resolution     ║")
 	log.Info().Msg("║                                          ║")
-	log.Info().Msg("║  Price Sources:                          ║")
-	log.Info().Msg("║  📊 CMC (1s updates, same as DataStreams)║")
-	log.Info().Msg("║  ⛓️ Chainlink (resolution oracle)        ║")
+	log.Info().Msg("║  🚀 Dynamic Sizing: 1x/2x/3x by move     ║")
 	log.Info().Msg("╚══════════════════════════════════════════╝")
 	log.Info().Msg("")
 	log.Info().Msg("💡 Use /help for commands")
@@ -181,10 +198,30 @@ func main() {
 	log.Info().Msg("Shutting down...")
 
 	telegramBot.Stop()
-	arbEngine.Stop()
-	windowScanner.Stop()
+	for _, engine := range arbEngines {
+		engine.Stop()
+	}
+	for _, scanner := range windowScanners {
+		scanner.Stop()
+	}
+	cmcClient.Stop()
 	chainlinkClient.Stop()
 	binanceClient.Stop()
 
 	log.Info().Msg("👋 Goodbye!")
+}
+
+// formatAssets formats asset list for display
+func formatAssets(assets []string) string {
+	if len(assets) == 1 {
+		return assets[0]
+	}
+	result := ""
+	for i, a := range assets {
+		if i > 0 {
+			result += ", "
+		}
+		result += a
+	}
+	return result
 }

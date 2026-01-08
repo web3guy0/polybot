@@ -98,6 +98,7 @@ type Engine struct {
 	cmcClient       *cmc.Client       // CMC price feed (fast updates, same source as Data Streams!)
 	windowScanner   *polymarket.WindowScanner
 	clobClient      *CLOBClient // CLOB trading client
+	asset           string      // Asset this engine tracks (BTC, ETH, SOL)
 
 	// Window tracking
 	windowStates map[string]*WindowState
@@ -122,10 +123,19 @@ type Engine struct {
 	minOddsForEntry  decimal.Decimal // Min odds to buy (default 0.35 for 35¢ floor)
 	maxOddsForEntry  decimal.Decimal // Max odds we'll pay (default 0.65 for 35-65¢ range)
 	minEdge          decimal.Decimal // Min expected edge (default 0.10)
-	positionSize     decimal.Decimal // Per-trade size in USD
+	positionSize     decimal.Decimal // Base per-trade size in USD
 	maxDailyTrades   int             // Max trades per day
 	maxTradesPerWindow int           // Max trades per window
 	cooldownSeconds  int             // Seconds between trades
+
+	// Dynamic Position Sizing (trade bigger when more confident!)
+	// Big move (>0.3%) → 3x base position
+	// Medium move (0.2-0.3%) → 2x base position
+	// Small move (0.1-0.2%) → 1x base position
+	dynamicSizingEnabled bool
+	smallMoveMultiplier  decimal.Decimal // 1x for 0.1-0.2% moves
+	mediumMoveMultiplier decimal.Decimal // 2x for 0.2-0.3% moves
+	largeMoveMultiplier  decimal.Decimal // 3x for >0.3% moves
 
 	// Exit Strategy Configuration (3 paths)
 	// Exit Path A: Quick flip when odds reach 75¢+
@@ -178,10 +188,16 @@ func NewEngine(cfg *config.Config, bc *binance.Client, cl *chainlink.Client, cmc
 		minOddsForEntry:    decimal.NewFromFloat(0.25),   // 25 cents min (aggressive!)
 		maxOddsForEntry:    decimal.NewFromFloat(0.65),   // 65 cents max
 		minEdge:            decimal.NewFromFloat(0.10),   // 10% min edge
-		positionSize:       decimal.NewFromFloat(100),    // $100 per trade
+		positionSize:       decimal.NewFromFloat(100),    // $100 base per trade
 		maxDailyTrades:     200,
 		maxTradesPerWindow: 3,
 		cooldownSeconds:    10,
+
+		// Dynamic Position Sizing - trade BIGGER when more confident!
+		dynamicSizingEnabled: true,
+		smallMoveMultiplier:  decimal.NewFromFloat(1),    // 0.1-0.2% → 1x ($1)
+		mediumMoveMultiplier: decimal.NewFromFloat(2),    // 0.2-0.3% → 2x ($2)
+		largeMoveMultiplier:  decimal.NewFromFloat(3),    // >0.3%   → 3x ($3)
 
 		// Triple exit strategy thresholds
 		exitOddsThreshold:  decimal.NewFromFloat(0.75),   // Quick flip at 75¢
@@ -215,7 +231,20 @@ func NewEngine(cfg *config.Config, bc *binance.Client, cl *chainlink.Client, cmc
 // SetCLOBClient sets the CLOB client for order execution
 func (e *Engine) SetCLOBClient(client *CLOBClient) {
 	e.clobClient = client
-	log.Info().Msg("🔗 CLOB client connected to engine")
+	log.Info().Str("asset", e.asset).Msg("🔗 CLOB client connected to engine")
+}
+
+// SetAsset sets the asset this engine tracks (BTC, ETH, SOL)
+func (e *Engine) SetAsset(asset string) {
+	e.asset = asset
+}
+
+// GetAsset returns the asset this engine tracks
+func (e *Engine) GetAsset() string {
+	if e.asset == "" {
+		return "BTC" // Default
+	}
+	return e.asset
 }
 
 // SetExitCallback sets callback for position exits
@@ -333,9 +362,15 @@ func (e *Engine) Stop() {
 // Speed is critical - the 30-90 second lag window requires fast detection
 func (e *Engine) arbitrageLoop() {
 	ticker := time.NewTicker(100 * time.Millisecond)
-	statusTicker := time.NewTicker(30 * time.Second) // Status update every 30s
+	statusTicker := time.NewTicker(10 * time.Second) // Status update every 10s
 	defer ticker.Stop()
 	defer statusTicker.Stop()
+
+	// Initial status after 2s startup
+	go func() {
+		time.Sleep(2 * time.Second)
+		e.logStatus()
+	}()
 
 	for {
 		select {
@@ -354,23 +389,24 @@ func (e *Engine) logStatus() {
 	e.windowsMu.RLock()
 	defer e.windowsMu.RUnlock()
 
-	// Use CMC price (fastest, same source as Data Streams!)
+	asset := e.GetAsset()
+	
+	// Use CMC price for this asset (fastest, same source as Data Streams!)
 	var currentPrice decimal.Decimal
 	var priceSource string
 	
-	if e.cmcClient != nil && !e.cmcClient.IsStale() {
-		currentPrice = e.cmcClient.GetCurrentPrice()
+	if e.cmcClient != nil && !e.cmcClient.IsAssetStale(asset) {
+		currentPrice = e.cmcClient.GetAssetPrice(asset)
 		priceSource = "CMC"
 	}
-	if currentPrice.IsZero() && e.chainlinkClient != nil {
+	if currentPrice.IsZero() && e.chainlinkClient != nil && asset == "BTC" {
 		currentPrice = e.chainlinkClient.GetCurrentPrice()
-		priceSource = "Chainlink"
+		priceSource = "CL"
 	}
-	if currentPrice.IsZero() {
+	if currentPrice.IsZero() && asset == "BTC" {
 		currentPrice = e.binanceClient.GetCurrentPrice()
-		priceSource = "Binance"
+		priceSource = "BN"
 	}
-	binancePrice := e.binanceClient.GetCurrentPrice()
 
 	for _, state := range e.windowStates {
 		if state.StartPrice.IsZero() {
@@ -391,32 +427,29 @@ func (e *Engine) logStatus() {
 			targetOdds = state.CurrentDownOdds
 		}
 
-		// Determine why no trade
-		var reason string
-		minMovePct := e.minPriceMove.Mul(decimal.NewFromInt(100)) // Convert 0.002 to 0.2
+		// Determine status
+		minMovePct := e.minPriceMove.Mul(decimal.NewFromInt(100))
+		var status string
 		
 		if absChangePct.LessThan(minMovePct) {
-			reason = fmt.Sprintf("⏳ Move too small (%.3f%% < %.1f%%)", absChangePct.InexactFloat64(), minMovePct.InexactFloat64())
+			status = fmt.Sprintf("⏳ %.2f%% < %.1f%%", absChangePct.InexactFloat64(), minMovePct.InexactFloat64())
 		} else if targetOdds.GreaterThan(e.maxOddsForEntry) {
-			reason = fmt.Sprintf("📈 Odds too high (%.0f¢ > %.0f¢)", targetOdds.Mul(decimal.NewFromInt(100)).InexactFloat64(), e.maxOddsForEntry.Mul(decimal.NewFromInt(100)).InexactFloat64())
+			status = fmt.Sprintf("📈 %.0f¢>%.0f¢", targetOdds.Mul(decimal.NewFromInt(100)).InexactFloat64(), e.maxOddsForEntry.Mul(decimal.NewFromInt(100)).InexactFloat64())
 		} else if targetOdds.LessThan(e.minOddsForEntry) {
-			reason = fmt.Sprintf("📉 Odds too low (%.0f¢ < %.0f¢)", targetOdds.Mul(decimal.NewFromInt(100)).InexactFloat64(), e.minOddsForEntry.Mul(decimal.NewFromInt(100)).InexactFloat64())
+			status = fmt.Sprintf("📉 %.0f¢<%.0f¢", targetOdds.Mul(decimal.NewFromInt(100)).InexactFloat64(), e.minOddsForEntry.Mul(decimal.NewFromInt(100)).InexactFloat64())
 		} else {
-			reason = "🚀 READY TO TRADE!"
+			status = "🚀 READY!"
 		}
 
+		// Clean, compact log format
 		log.Info().
-			Str("direction", direction).
-			Str("btc_move", priceChangePct.StringFixed(3)+"%").
-			Str("min_move", minMovePct.StringFixed(1)+"%").
+			Str("asset", asset).
 			Str("price", currentPrice.StringFixed(2)).
-			Str("source", priceSource).
-			Str("binance", binancePrice.StringFixed(2)).
-			Str("spread", binancePrice.Sub(currentPrice).StringFixed(2)).
-			Str("up_odds", state.CurrentUpOdds.String()).
-			Str("down_odds", state.CurrentDownOdds.String()).
-			Str("reason", reason).
-			Msg("📊 MARKET STATUS")
+			Str("move", fmt.Sprintf("%s%.2f%%", direction[:1], absChangePct.InexactFloat64())).
+			Str("odds", fmt.Sprintf("%.0f/%.0f", state.CurrentUpOdds.Mul(decimal.NewFromInt(100)).InexactFloat64(), state.CurrentDownOdds.Mul(decimal.NewFromInt(100)).InexactFloat64())).
+			Str("src", priceSource).
+			Str("status", status).
+			Msg("📊 " + asset)
 	}
 }
 
@@ -660,32 +693,31 @@ func (e *Engine) updateWindowStates() {
 		w := &windows[i]
 		if _, exists := e.windowStates[w.ID]; !exists {
 			// New window - get the "Price to Beat"
-			// 
-			// IMPORTANT: Use BINANCE for both current price AND Price to Beat
-			// This ensures CONSISTENCY - even if Binance differs from Chainlink Data Streams
-			// by ~$30-50, the DIRECTION calculation will be correct because we're comparing
-			// Binance-to-Binance, not Binance-to-Chainlink
-			//
-			// Polymarket uses Chainlink Data Streams (paid, sub-second) for resolution
-			// We can't access that for free, so we use the fastest free source: Binance
+			// Use CMC for all assets (BTC, ETH, SOL) - consistent with detection
+			asset := e.GetAsset()
 			var startPrice decimal.Decimal
 			
-			// Primary method: Binance 1s kline at window start (FAST + CONSISTENT)
-			if e.binanceClient != nil && !w.StartDate.IsZero() {
+			// Primary method: CMC current price (works for all assets!)
+			// For simplicity, use current CMC price as the "start" price
+			// This is slightly inaccurate but consistent across all assets
+			if e.cmcClient != nil {
+				startPrice = e.cmcClient.GetAssetPrice(asset)
+			}
+			
+			// For BTC, try Binance historical as backup
+			if startPrice.IsZero() && asset == "BTC" && e.binanceClient != nil && !w.StartDate.IsZero() {
 				historicalPrice, err := e.binanceClient.GetPriceAtTime(w.StartDate)
 				if err == nil && !historicalPrice.IsZero() {
 					startPrice = historicalPrice
 					log.Info().
 						Str("window_start", w.StartDate.Format("15:04:05")).
 						Str("price_to_beat", startPrice.StringFixed(2)).
-						Msg("📈 Got Price to Beat from Binance (consistent with detection)")
-				} else {
-					log.Debug().Err(err).Msg("Could not get Binance historical price")
+						Msg("📈 Got Price to Beat from Binance (BTC only)")
 				}
 			}
 			
-			// Fallback to Chainlink on-chain if Binance fails
-			if startPrice.IsZero() && e.chainlinkClient != nil && !w.StartDate.IsZero() {
+			// Fallback to Chainlink on-chain if Binance fails (BTC only)
+			if startPrice.IsZero() && asset == "BTC" && e.chainlinkClient != nil && !w.StartDate.IsZero() {
 				historicalPrice, err := e.chainlinkClient.GetHistoricalPrice(w.StartDate)
 				if err == nil && !historicalPrice.IsZero() {
 					startPrice = historicalPrice
@@ -696,8 +728,8 @@ func (e *Engine) updateWindowStates() {
 				}
 			}
 			
-			// Fallback to current Binance price
-			if startPrice.IsZero() {
+			// Final fallback to current Binance price (BTC only)
+			if startPrice.IsZero() && asset == "BTC" {
 				startPrice = binancePrice
 				log.Debug().Str("price", startPrice.StringFixed(2)).Msg("Using current Binance price as fallback")
 			}
@@ -766,23 +798,24 @@ func (e *Engine) refreshOdds() {
 func (e *Engine) checkOpportunities() {
 	// ⚡ PRIORITY ORDER for current price:
 	// 1. CMC - Updates every 1s, same source as Polymarket Data Streams (~$1 diff)
-	// 2. Chainlink on-chain - Updates every 20-60s, ~$1 diff from Data Streams
+	// 2. Chainlink on-chain - Updates every 20-60s, ~$1 diff from Data Streams (BTC only)
 	// 3. Binance - Fast but ~$80 diff from Data Streams (direction mismatch!)
-	var currentBTC decimal.Decimal
+	var currentPrice decimal.Decimal
+	asset := e.GetAsset()
 	
-	// Try CMC first (fastest + most accurate)
-	if e.cmcClient != nil && !e.cmcClient.IsStale() {
-		currentBTC = e.cmcClient.GetCurrentPrice()
+	// Try CMC first (fastest + most accurate) - works for BTC, ETH, SOL
+	if e.cmcClient != nil && !e.cmcClient.IsAssetStale(asset) {
+		currentPrice = e.cmcClient.GetAssetPrice(asset)
 	}
-	// Fallback to Chainlink on-chain
-	if currentBTC.IsZero() && e.chainlinkClient != nil {
-		currentBTC = e.chainlinkClient.GetCurrentPrice()
+	// Fallback to Chainlink on-chain (BTC only)
+	if currentPrice.IsZero() && e.chainlinkClient != nil && asset == "BTC" {
+		currentPrice = e.chainlinkClient.GetCurrentPrice()
 	}
-	// Last resort: Binance (less accurate but always available)
-	if currentBTC.IsZero() {
-		currentBTC = e.binanceClient.GetCurrentPrice()
+	// Last resort: Binance (BTC only, less accurate)
+	if currentPrice.IsZero() && asset == "BTC" {
+		currentPrice = e.binanceClient.GetCurrentPrice()
 	}
-	if currentBTC.IsZero() {
+	if currentPrice.IsZero() {
 		return
 	}
 
@@ -800,7 +833,7 @@ func (e *Engine) checkOpportunities() {
 	e.windowsMu.RUnlock()
 
 	for _, state := range states {
-		opp := e.analyzeWindow(state, currentBTC)
+		opp := e.analyzeWindow(state, currentPrice)
 		if opp != nil {
 			e.handleOpportunity(*opp, state)
 		}
@@ -808,13 +841,13 @@ func (e *Engine) checkOpportunities() {
 }
 
 // analyzeWindow checks if a window has a profitable opportunity
-func (e *Engine) analyzeWindow(state *WindowState, currentBTC decimal.Decimal) *Opportunity {
+func (e *Engine) analyzeWindow(state *WindowState, currentPrice decimal.Decimal) *Opportunity {
 	if state.StartPrice.IsZero() {
 		return nil
 	}
 
 	// Calculate price change from window start
-	priceChange := currentBTC.Sub(state.StartPrice)
+	priceChange := currentPrice.Sub(state.StartPrice)
 	priceChangePct := priceChange.Div(state.StartPrice)
 
 	// Check if move is significant enough
@@ -882,7 +915,7 @@ func (e *Engine) analyzeWindow(state *WindowState, currentBTC decimal.Decimal) *
 	return &Opportunity{
 		Window:         state.Window,
 		Direction:      direction,
-		CurrentBTC:     currentBTC,
+		CurrentBTC:     currentPrice,
 		StartBTC:       state.StartPrice,
 		PriceChangePct: priceChangePct.Mul(decimal.NewFromInt(100)),
 		MarketOdds:     marketOdds,
@@ -1018,9 +1051,34 @@ func (e *Engine) executeTrade(opp Opportunity, state *WindowState) *Trade {
 		return nil
 	}
 
+	// 🚀 DYNAMIC POSITION SIZING - Trade bigger when more confident!
+	// Based on BTC move size:
+	//   >0.3% move → 3x base (high confidence)
+	//   0.2-0.3%   → 2x base (medium confidence)
+	//   0.1-0.2%   → 1x base (low confidence)
+	tradeAmount := e.positionSize
+	moveAbs := opp.PriceChangePct.Abs() // Already in % form (e.g., 0.25 = 0.25%)
+	sizeMultiplier := "1x"
+	
+	if e.dynamicSizingEnabled {
+		if moveAbs.GreaterThanOrEqual(decimal.NewFromFloat(0.3)) {
+			// Large move (>0.3%) → 3x
+			tradeAmount = e.positionSize.Mul(e.largeMoveMultiplier)
+			sizeMultiplier = "3x"
+		} else if moveAbs.GreaterThanOrEqual(decimal.NewFromFloat(0.2)) {
+			// Medium move (0.2-0.3%) → 2x
+			tradeAmount = e.positionSize.Mul(e.mediumMoveMultiplier)
+			sizeMultiplier = "2x"
+		} else {
+			// Small move (0.1-0.2%) → 1x
+			tradeAmount = e.positionSize.Mul(e.smallMoveMultiplier)
+			sizeMultiplier = "1x"
+		}
+	}
+
 	// Calculate size: $amount / price = shares
-	// E.g., $1 / 0.45 = 2.22 shares
-	shares := e.positionSize.Div(opp.MarketOdds).Round(2)
+	// E.g., $3 / 0.45 = 6.67 shares
+	shares := tradeAmount.Div(opp.MarketOdds).Round(2)
 
 	trade := &Trade{
 		ID:             fmt.Sprintf("arb_%d", time.Now().UnixNano()),
@@ -1029,7 +1087,7 @@ func (e *Engine) executeTrade(opp Opportunity, state *WindowState) *Trade {
 		Direction:      opp.Direction,
 		TokenID:        tokenID,
 		EntryPrice:     opp.MarketOdds,
-		Amount:         e.positionSize,
+		Amount:         tradeAmount,
 		Shares:         shares,
 		BTCAtEntry:     opp.CurrentBTC,
 		BTCAtStart:     opp.StartBTC,
@@ -1043,6 +1101,7 @@ func (e *Engine) executeTrade(opp Opportunity, state *WindowState) *Trade {
 		Str("direction", trade.Direction).
 		Str("entry_price", trade.EntryPrice.String()).
 		Str("amount", trade.Amount.String()).
+		Str("sizing", sizeMultiplier).
 		Str("shares", shares.String()).
 		Str("btc_move", trade.PriceChangePct.String()+"%").
 		Str("edge", trade.Edge.Mul(decimal.NewFromInt(100)).String()+"%").

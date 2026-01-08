@@ -3,10 +3,12 @@ package database
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/rs/zerolog/log"
 	"github.com/shopspring/decimal"
+	"gorm.io/driver/postgres"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
@@ -62,6 +64,33 @@ type Trade struct {
 	UpdatedAt    time.Time
 }
 
+// ArbTrade represents an arbitrage trade for the latency arb strategy
+type ArbTrade struct {
+	ID             string          `gorm:"primaryKey"`
+	Asset          string          `gorm:"index"` // BTC, ETH, SOL
+	WindowID       string          `gorm:"index"`
+	Question       string
+	Direction      string          // "UP" or "DOWN"
+	TokenID        string
+	EntryPrice     decimal.Decimal `gorm:"type:decimal(10,6)"`
+	ExitPrice      decimal.Decimal `gorm:"type:decimal(10,6)"`
+	Amount         decimal.Decimal `gorm:"type:decimal(20,6)"`
+	Shares         decimal.Decimal `gorm:"type:decimal(20,6)"`
+	BTCAtEntry     decimal.Decimal `gorm:"type:decimal(20,6)"`
+	BTCAtStart     decimal.Decimal `gorm:"type:decimal(20,6)"`
+	PriceChangePct decimal.Decimal `gorm:"type:decimal(10,6)"`
+	Edge           decimal.Decimal `gorm:"type:decimal(10,6)"`
+	SizeMultiplier string          // "1x", "2x", "3x"
+	Status         string          `gorm:"index"` // "open", "filled", "exited", "won", "lost"
+	ExitType       string          // "quick_flip", "resolution", "stop_loss"
+	Profit         decimal.Decimal `gorm:"type:decimal(20,6)"`
+	EnteredAt      time.Time
+	ExitedAt       *time.Time
+	ResolvedAt     *time.Time
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
+}
+
 type Alert struct {
 	ID         uint   `gorm:"primaryKey;autoIncrement"`
 	MarketID   string `gorm:"index"`
@@ -83,25 +112,38 @@ type UserSettings struct {
 }
 
 func New(dbPath string) (*Database, error) {
-	// Ensure directory exists
-	dir := filepath.Dir(dbPath)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return nil, err
+	var db *gorm.DB
+	var err error
+
+	// Check if this is a PostgreSQL connection string
+	if strings.HasPrefix(dbPath, "postgres://") || strings.HasPrefix(dbPath, "postgresql://") {
+		// PostgreSQL connection
+		db, err = gorm.Open(postgres.Open(dbPath), &gorm.Config{
+			Logger: logger.Default.LogMode(logger.Silent),
+		})
+		if err != nil {
+			return nil, err
+		}
+		log.Info().Msg("Database connected (PostgreSQL)")
+	} else {
+		// SQLite fallback
+		dir := filepath.Dir(dbPath)
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return nil, err
+		}
+		db, err = gorm.Open(sqlite.Open(dbPath), &gorm.Config{
+			Logger: logger.Default.LogMode(logger.Silent),
+		})
+		if err != nil {
+			return nil, err
+		}
+		log.Info().Str("path", dbPath).Msg("Database initialized (SQLite)")
 	}
 
-	db, err := gorm.Open(sqlite.Open(dbPath), &gorm.Config{
-		Logger: logger.Default.LogMode(logger.Silent),
-	})
-	if err != nil {
+	// Auto migrate all models
+	if err := db.AutoMigrate(&Market{}, &Opportunity{}, &Trade{}, &ArbTrade{}, &Alert{}, &UserSettings{}); err != nil {
 		return nil, err
 	}
-
-	// Auto migrate
-	if err := db.AutoMigrate(&Market{}, &Opportunity{}, &Trade{}, &Alert{}, &UserSettings{}); err != nil {
-		return nil, err
-	}
-
-	log.Info().Str("path", dbPath).Msg("Database initialized")
 
 	return &Database{db: db}, nil
 }
@@ -200,6 +242,95 @@ func (d *Database) GetStats() (map[string]interface{}, error) {
 	var marketCount int64
 	d.db.Model(&Market{}).Where("active = ?", true).Count(&marketCount)
 	stats["active_markets"] = marketCount
+
+	return stats, nil
+}
+
+// ============ ARBITRAGE TRADE OPERATIONS ============
+
+// SaveArbTrade saves an arbitrage trade to the database
+func (d *Database) SaveArbTrade(trade *ArbTrade) error {
+	trade.CreatedAt = time.Now()
+	trade.UpdatedAt = time.Now()
+	return d.db.Create(trade).Error
+}
+
+// UpdateArbTrade updates an existing arbitrage trade
+func (d *Database) UpdateArbTrade(trade *ArbTrade) error {
+	trade.UpdatedAt = time.Now()
+	return d.db.Save(trade).Error
+}
+
+// GetArbTrade retrieves a single arbitrage trade by ID
+func (d *Database) GetArbTrade(id string) (*ArbTrade, error) {
+	var trade ArbTrade
+	err := d.db.First(&trade, "id = ?", id).Error
+	return &trade, err
+}
+
+// GetRecentArbTrades gets recent arbitrage trades
+func (d *Database) GetRecentArbTrades(limit int) ([]ArbTrade, error) {
+	var trades []ArbTrade
+	err := d.db.Order("entered_at DESC").Limit(limit).Find(&trades).Error
+	return trades, err
+}
+
+// GetOpenArbTrades gets all open arbitrage trades
+func (d *Database) GetOpenArbTrades() ([]ArbTrade, error) {
+	var trades []ArbTrade
+	err := d.db.Where("status IN ?", []string{"open", "filled"}).Order("entered_at DESC").Find(&trades).Error
+	return trades, err
+}
+
+// GetArbTradesByAsset gets trades for a specific asset
+func (d *Database) GetArbTradesByAsset(asset string, limit int) ([]ArbTrade, error) {
+	var trades []ArbTrade
+	err := d.db.Where("asset = ?", asset).Order("entered_at DESC").Limit(limit).Find(&trades).Error
+	return trades, err
+}
+
+// GetArbTradeStats gets aggregate statistics for arbitrage trades
+func (d *Database) GetArbTradeStats() (map[string]interface{}, error) {
+	stats := make(map[string]interface{})
+
+	// Total trades
+	var totalCount int64
+	d.db.Model(&ArbTrade{}).Count(&totalCount)
+	stats["total_trades"] = totalCount
+
+	// Won/Lost
+	var wonCount int64
+	d.db.Model(&ArbTrade{}).Where("status = ?", "won").Count(&wonCount)
+	stats["won_trades"] = wonCount
+
+	var lostCount int64
+	d.db.Model(&ArbTrade{}).Where("status = ?", "lost").Count(&lostCount)
+	stats["lost_trades"] = lostCount
+
+	// Open positions
+	var openCount int64
+	d.db.Model(&ArbTrade{}).Where("status IN ?", []string{"open", "filled"}).Count(&openCount)
+	stats["open_positions"] = openCount
+
+	// Total profit
+	var profitResult struct {
+		Total decimal.Decimal
+	}
+	d.db.Model(&ArbTrade{}).Select("COALESCE(SUM(profit), 0) as total").Scan(&profitResult)
+	stats["total_profit"] = profitResult.Total
+
+	// By asset
+	type AssetCount struct {
+		Asset string
+		Count int64
+	}
+	var assetCounts []AssetCount
+	d.db.Model(&ArbTrade{}).Select("asset, count(*) as count").Group("asset").Scan(&assetCounts)
+	assetStats := make(map[string]int64)
+	for _, ac := range assetCounts {
+		assetStats[ac.Asset] = ac.Count
+	}
+	stats["by_asset"] = assetStats
 
 	return stats, nil
 }
