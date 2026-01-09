@@ -353,7 +353,7 @@ func (c *CLOBClient) PlaceOrder(order Order) (*OrderResponse, error) {
 		"size":       order.Size.String(),
 		"side":       order.Side,
 		"type":       order.OrderType,
-		"feeRateBps": "0",
+		"feeRateBps": "1000",
 	}
 
 	if order.Expiration > 0 {
@@ -485,16 +485,26 @@ func (c *CLOBClient) placeOrder(tokenID string, side int, size decimal.Decimal, 
 	return c.submitSignedOrder(signedOrder)
 }
 
-// submitSignedOrder posts a signed order to the CLOB API
+// submitSignedOrder posts a signed order to the CLOB API (defaults to FOK)
 func (c *CLOBClient) submitSignedOrder(signedOrder *SignedCTFOrder) (*OrderResponse, error) {
+	return c.submitSignedOrderWithType(signedOrder, "FOK")
+}
+
+// submitSignedOrderWithType posts a signed order with a specific order type
+func (c *CLOBClient) submitSignedOrderWithType(signedOrder *SignedCTFOrder, orderType string) (*OrderResponse, error) {
 	start := time.Now()
 
-	// Build request payload
-	payload := signedOrder.ToAPIPayload()
+	// Build request payload - owner must be API key!
+	payload := signedOrder.ToAPIPayloadWithType(c.apiKey, orderType)
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal order: %w", err)
 	}
+
+	// DEBUG: Log the full payload being sent
+	log.Debug().
+		RawJSON("request_payload", body).
+		Msg("📤 Sending order to CLOB API")
 
 	// Create request
 	req, err := http.NewRequest("POST", c.baseURL+"/order", bytes.NewReader(body))
@@ -535,6 +545,85 @@ func (c *CLOBClient) submitSignedOrder(signedOrder *SignedCTFOrder) (*OrderRespo
 		Msg("✅ Order submitted successfully")
 
 	return &orderResp, nil
+}
+
+// PlaceLimitOrder places a limit order at a specific price (GTC - stays on book)
+// Returns the order ID for tracking
+func (c *CLOBClient) PlaceLimitOrder(tokenID string, price, size decimal.Decimal, side string) (string, error) {
+	sideInt := SideBuy
+	if side == "SELL" {
+		sideInt = SideSell
+	}
+
+	// Create order signer
+	signer := NewOrderSigner(c.privateKey, c.address, c.funderAddress, c.signatureType)
+
+	// Create and sign order at exact price (no slippage for limit orders)
+	signedOrder, err := signer.CreateSignedOrder(tokenID, sideInt, price, size)
+	if err != nil {
+		return "", fmt.Errorf("failed to sign order: %w", err)
+	}
+
+	log.Info().
+		Str("token", tokenID[:20]+"...").
+		Str("side", side).
+		Str("size", size.String()).
+		Str("price", price.String()).
+		Msg("⚡ Order signed (native Go)")
+
+	// Submit as GTC (Good Till Cancelled) so it stays on book
+	resp, err := c.submitSignedOrderWithType(signedOrder, "GTC")
+	if err != nil {
+		return "", err
+	}
+
+	if resp.OrderID == "" {
+		return "", fmt.Errorf("no order ID returned: %s", resp.Message)
+	}
+
+	log.Info().
+		Str("order_id", resp.OrderID).
+		Str("token_id", tokenID[:16]+"...").
+		Str("price", price.String()).
+		Str("size", size.String()).
+		Str("side", side).
+		Msg("📋 Limit order placed")
+
+	return resp.OrderID, nil
+}
+
+// GetOrderStatus checks the status of an order
+func (c *CLOBClient) GetOrderStatus(orderID string) (status string, filledSize, filledPrice decimal.Decimal, err error) {
+	req, err := http.NewRequest("GET", c.baseURL+"/order/"+orderID, nil)
+	if err != nil {
+		return "", decimal.Zero, decimal.Zero, err
+	}
+
+	c.signL2Request(req, "GET", "/order/"+orderID, nil)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return "", decimal.Zero, decimal.Zero, err
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+
+	var orderInfo struct {
+		OrderID     string `json:"order_id"`
+		Status      string `json:"status"` // "live", "matched", "cancelled"
+		SizeFilled  string `json:"size_filled"`
+		PriceFilled string `json:"price_filled"`
+	}
+
+	if err := json.Unmarshal(respBody, &orderInfo); err != nil {
+		return "", decimal.Zero, decimal.Zero, err
+	}
+
+	filledSize, _ = decimal.NewFromString(orderInfo.SizeFilled)
+	filledPrice, _ = decimal.NewFromString(orderInfo.PriceFilled)
+
+	return orderInfo.Status, filledSize, filledPrice, nil
 }
 
 // CancelOrder cancels an open order
@@ -664,6 +753,26 @@ func (c *CLOBClient) GetAddress() string {
 		return c.address.Hex()
 	}
 	return ""
+}
+
+// PrivateKey returns the private key (for signing)
+func (c *CLOBClient) PrivateKey() *ecdsa.PrivateKey {
+	return c.privateKey
+}
+
+// Address returns the signing address
+func (c *CLOBClient) Address() common.Address {
+	return c.address
+}
+
+// FunderAddress returns the funder address
+func (c *CLOBClient) FunderAddress() common.Address {
+	return c.funderAddress
+}
+
+// ApiKey returns the API key
+func (c *CLOBClient) ApiKey() string {
+	return c.apiKey
 }
 
 // Legacy function for backward compatibility

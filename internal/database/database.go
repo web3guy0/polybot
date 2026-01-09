@@ -268,6 +268,11 @@ func (d *Database) GetArbTrade(id string) (*ArbTrade, error) {
 	return &trade, err
 }
 
+// DeleteArbTrade deletes an arbitrage trade by ID (used for test cleanup)
+func (d *Database) DeleteArbTrade(id string) error {
+	return d.db.Delete(&ArbTrade{}, "id = ?", id).Error
+}
+
 // GetRecentArbTrades gets recent arbitrage trades
 func (d *Database) GetRecentArbTrades(limit int) ([]ArbTrade, error) {
 	var trades []ArbTrade

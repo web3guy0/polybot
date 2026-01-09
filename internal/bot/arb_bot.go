@@ -171,6 +171,11 @@ func (b *ArbBot) SetAllEngines(engines []*arbitrage.Engine) {
 			b.saveArbTradeToDb(trade, asset)
 		})
 		
+		// Exit callback - update database when position is closed
+		engine.SetExitCallback(func(trade arbitrage.Trade) {
+			b.UpdateTradeExit(trade, asset)
+		})
+		
 		log.Debug().Str("asset", asset).Msg("📊 Callbacks configured for engine")
 	}
 }
@@ -242,6 +247,8 @@ func (b *ArbBot) handleMessage(msg *tgbotapi.Message) {
 		b.cmdAllAssets(chatID)
 	case "config", "cfg":
 		b.cmdConfig(chatID)
+	case "dbtest":
+		b.cmdDBTest(chatID)
 	case "help", "h":
 		b.cmdHelp(chatID)
 	default:
@@ -527,6 +534,82 @@ func (b *ArbBot) cmdHelp(chatID int64) {
 💡 All data refreshes in real-time`
 
 	b.sendMarkdown(chatID, msg)
+}
+
+func (b *ArbBot) cmdDBTest(chatID int64) {
+	if b.db == nil {
+		b.sendMarkdown(chatID, "❌ *Database not connected*")
+		return
+	}
+
+	b.sendMarkdown(chatID, "🔄 *Testing database connection...*")
+
+	// Create a mock trade
+	mockTrade := &database.ArbTrade{
+		ID:             fmt.Sprintf("test_%d", time.Now().UnixNano()),
+		Asset:          "BTC",
+		WindowID:       "test_window_123",
+		Question:       "DB Test: Will BTC be above $100,000?",
+		Direction:      "UP",
+		TokenID:        "test_token_id",
+		EntryPrice:     decimal.NewFromFloat(0.45),
+		ExitPrice:      decimal.Zero,
+		Amount:         decimal.NewFromFloat(10.0),
+		Shares:         decimal.NewFromFloat(22.22),
+		BTCAtEntry:     decimal.NewFromFloat(95000),
+		BTCAtStart:     decimal.NewFromFloat(94500),
+		PriceChangePct: decimal.NewFromFloat(0.53),
+		Edge:           decimal.NewFromFloat(0.05),
+		SizeMultiplier: "1x",
+		Status:         "test",
+		ExitType:       "",
+		Profit:         decimal.Zero,
+		EnteredAt:      time.Now(),
+	}
+
+	// Save to database
+	err := b.db.SaveArbTrade(mockTrade)
+	if err != nil {
+		b.sendMarkdown(chatID, fmt.Sprintf("❌ *Failed to save:*\n`%s`", err.Error()))
+		return
+	}
+
+	// Read it back
+	retrieved, err := b.db.GetArbTrade(mockTrade.ID)
+	if err != nil {
+		b.sendMarkdown(chatID, fmt.Sprintf("❌ *Saved but failed to read:*\n`%s`", err.Error()))
+		return
+	}
+
+	// Verify data matches
+	text := fmt.Sprintf(`✅ *Database Test PASSED*
+━━━━━━━━━━━━━━━━━━━━━
+
+*Write Test:* ✅ Success
+*Read Test:* ✅ Success
+
+*Mock Trade Saved:*
+• ID: %s
+• Asset: %s
+• Direction: %s
+• Entry: %.0f¢
+• Amount: $%s
+• Status: %s
+
+━━━━━━━━━━━━━━━━━━━━━
+💾 Database connection verified!`,
+		retrieved.ID[:20]+"...",
+		retrieved.Asset,
+		retrieved.Direction,
+		retrieved.EntryPrice.Mul(decimal.NewFromInt(100)).InexactFloat64(),
+		retrieved.Amount.StringFixed(2),
+		retrieved.Status,
+	)
+
+	b.sendMarkdown(chatID, text)
+
+	// Clean up test data
+	b.db.DeleteArbTrade(mockTrade.ID)
 }
 
 // ==================== MESSAGE BUILDERS ====================
@@ -1528,6 +1611,76 @@ func (b *ArbBot) saveArbTradeToDb(trade arbitrage.Trade, asset string) {
 	} else {
 		log.Debug().Str("trade_id", trade.ID).Str("asset", asset).Msg("💾 Trade saved to database")
 	}
+}
+
+// UpdateTradeExit updates a trade record when position is exited
+func (b *ArbBot) UpdateTradeExit(trade arbitrage.Trade, asset string) {
+	if b.db == nil {
+		return
+	}
+
+	// Get existing trade
+	dbTrade, err := b.db.GetArbTrade(trade.ID)
+	if err != nil {
+		log.Error().Err(err).Str("trade_id", trade.ID).Msg("Failed to get trade for exit update")
+		return
+	}
+
+	// Update exit fields
+	dbTrade.ExitPrice = trade.ExitPrice
+	dbTrade.ExitType = trade.ExitType
+	dbTrade.Status = trade.Status
+	dbTrade.Profit = trade.Profit
+	dbTrade.ExitedAt = trade.ExitedAt
+
+	if err := b.db.UpdateArbTrade(dbTrade); err != nil {
+		log.Error().Err(err).Str("trade_id", trade.ID).Msg("Failed to update trade exit in database")
+	} else {
+		profitEmoji := "💚"
+		if trade.Profit.IsNegative() {
+			profitEmoji = "💔"
+		}
+		log.Info().
+			Str("trade_id", trade.ID).
+			Str("asset", asset).
+			Str("exit_type", trade.ExitType).
+			Str("exit_price", trade.ExitPrice.StringFixed(2)).
+			Str("profit", trade.Profit.StringFixed(2)).
+			Msgf("%s Trade exit saved to database", profitEmoji)
+	}
+
+	// Send Telegram alert for exits
+	b.sendExitAlert(trade)
+}
+
+// sendExitAlert notifies on Telegram when a position is exited
+func (b *ArbBot) sendExitAlert(trade arbitrage.Trade) {
+	profitEmoji := "💚"
+	profitLabel := "Profit"
+	if trade.Profit.IsNegative() {
+		profitEmoji = "💔"
+		profitLabel = "Loss"
+	}
+
+	text := fmt.Sprintf(`%s *POSITION EXITED*
+━━━━━━━━━━━━━━━━━━━━━
+
+📊 *%s* %s
+
+*Entry:* %.0f¢ → *Exit:* %.0f¢
+*Type:* %s
+*%s:* $%s
+
+━━━━━━━━━━━━━━━━━━━━━`,
+		profitEmoji,
+		trade.Direction, trade.Question,
+		trade.EntryPrice.Mul(decimal.NewFromInt(100)).InexactFloat64(),
+		trade.ExitPrice.Mul(decimal.NewFromInt(100)).InexactFloat64(),
+		trade.ExitType,
+		profitLabel, trade.Profit.Abs().StringFixed(2),
+	)
+
+	b.sendMarkdown(b.cfg.TelegramChatID, text)
 }
 
 func (b *ArbBot) sendTradeAlert(chatID int64, trade arbitrage.Trade) {

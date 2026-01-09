@@ -18,6 +18,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/joho/godotenv"
 	"github.com/rs/zerolog"
@@ -39,6 +40,22 @@ func main() {
 	// Setup logging
 	log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr})
 	zerolog.SetGlobalLevel(zerolog.InfoLevel)
+
+	// Check for analysis mode
+	if len(os.Args) > 1 && os.Args[1] == "--analyze" {
+		arbitrage.PrintProbabilityAnalysis()
+		
+		// Run Monte Carlo for all conditions
+		conditions := arbitrage.MarketConditions{
+			Profile:          arbitrage.MediumVolProfile,
+			AvgSpread:        0.02,
+			OrderBookDepth:   1000,
+			CompetitorBots:   5,
+			LatencyAdvantage: 50,
+		}
+		arbitrage.MonteCarloSimulation(conditions, 10000)
+		return
+	}
 
 	// Load environment
 	if err := godotenv.Load(); err != nil {
@@ -93,6 +110,12 @@ func main() {
 	}
 	log.Info().Msg("📈 Binance WebSocket connected")
 
+	// 1b. Multi-asset Binance client - BTC, ETH, SOL real-time prices
+	binanceMulti := binance.NewMultiClient(assets...)
+	if err := binanceMulti.Start(); err != nil {
+		log.Warn().Err(err).Msg("⚠️ Failed to start multi-asset Binance")
+	}
+
 	// 2. Chainlink client - BTC/USD price feed on Polygon (what Polymarket uses for resolution)
 	chainlinkClient := chainlink.NewClient()
 	if err := chainlinkClient.Start(); err != nil {
@@ -101,10 +124,23 @@ func main() {
 		log.Info().Msg("⛓️ Chainlink price feed connected (Polygon)")
 	}
 
+	// 2b. Multi-asset Chainlink client - BTC, ETH, SOL price feeds for Price to Beat
+	multiChainlink := chainlink.NewMultiClient(assets...)
+	if err := multiChainlink.Start(); err != nil {
+		log.Warn().Err(err).Msg("⚠️ Failed to start multi-asset Chainlink - using CMC only for ETH/SOL")
+	}
+
 	// 3. CMC client - fast price updates for ALL assets (BTC, ETH, SOL)
 	cmcClient := cmc.NewClient(assets...)
 	cmcClient.Start()
 	log.Info().Strs("assets", assets).Msg("📊 CMC price feed started (1s updates)")
+
+	// 3b. Polymarket WebSocket client - real-time odds updates
+	wsClient := polymarket.NewWSClient()
+	if err := wsClient.Connect(); err != nil {
+		log.Warn().Err(err).Msg("⚠️ Failed to connect Polymarket WebSocket - using HTTP polling")
+		wsClient = nil
+	}
 
 	// 4. CLOB client - for trading and account data (shared across all engines)
 	var clobClient *arbitrage.CLOBClient
@@ -141,12 +177,53 @@ func main() {
 		// Arbitrage engine for this asset
 		engine := arbitrage.NewEngine(cfg, binanceClient, chainlinkClient, cmcClient, scanner)
 		engine.SetAsset(asset) // Tell engine which asset it's tracking
+		
+		// Wire up multi-asset Chainlink for Price to Beat
+		if multiChainlink != nil {
+			engine.SetMultiChainlink(multiChainlink)
+		}
+		
+		// Wire up multi-asset Binance for all assets
+		if binanceMulti != nil {
+			engine.SetBinanceMulti(binanceMulti)
+		}
+		
+		// Wire up WebSocket for real-time odds
+		if wsClient != nil {
+			engine.SetWSClient(wsClient)
+		}
+		
 		if clobClient != nil {
 			engine.SetCLOBClient(clobClient)
 		}
 		engine.Start()
 		arbEngines = append(arbEngines, engine)
 		log.Info().Str("asset", asset).Msg("⚡ Arbitrage engine started")
+	}
+
+	// ====== SMART DUAL-SIDE STRATEGY ======
+	// "Wait for Cheap" approach - enter when one side drops to cheap threshold
+	smartDualStrategies := make([]*arbitrage.SmartDualStrategy, 0, len(assets))
+	for i, asset := range assets {
+		smartDual := arbitrage.NewSmartDualStrategy(windowScanners[i], clobClient, cfg.DryRun)
+		smartDual.Start()
+		smartDualStrategies = append(smartDualStrategies, smartDual)
+		log.Info().Str("asset", asset).Bool("paper", cfg.DryRun).Msg("🎯 Smart dual-side strategy started")
+	}
+	
+	// Subscribe to WebSocket markets for all active windows
+	if wsClient != nil {
+		go func() {
+			// Wait for initial window scan
+			time.Sleep(3 * time.Second)
+			for _, scanner := range windowScanners {
+				for _, w := range scanner.GetActiveWindows() {
+					if w.ConditionID != "" && w.YesTokenID != "" {
+						wsClient.Subscribe(w.ConditionID, w.YesTokenID, w.NoTokenID)
+					}
+				}
+			}
+		}()
 	}
 
 	// Use first engine as primary for Telegram bot (BTC typically)
@@ -179,6 +256,7 @@ func main() {
 	log.Info().Msg("║  → Exit at 75¢ OR hold to resolution     ║")
 	log.Info().Msg("║                                          ║")
 	log.Info().Msg("║  🚀 Dynamic Sizing: 1x/2x/3x by move     ║")
+	log.Info().Msg("║  🎯 Smart Dual: Wait for cheap sides     ║")
 	log.Info().Msg("╚══════════════════════════════════════════╝")
 	log.Info().Msg("")
 	log.Info().Msg("💡 Use /help for commands")
@@ -200,6 +278,9 @@ func main() {
 	telegramBot.Stop()
 	for _, engine := range arbEngines {
 		engine.Stop()
+	}
+	for _, smartDual := range smartDualStrategies {
+		smartDual.Stop()
 	}
 	for _, scanner := range windowScanners {
 		scanner.Stop()

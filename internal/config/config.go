@@ -41,14 +41,15 @@ FunderAddress    string // Address that holds funds (may differ from signing key
 SignatureType    int    // 0=EOA, 1=Magic/Email, 2=Proxy
 
 	// Arbitrage Settings
-	ArbEnabled         bool
-	ArbMinPriceMove    decimal.Decimal // e.g., 0.002 = 0.2%
-	ArbMinOddsForEntry decimal.Decimal // e.g., 0.35 = 35 cents (min entry)
-	ArbMaxOddsForEntry decimal.Decimal // e.g., 0.65 = 65 cents (max entry)
-	ArbMinEdge         decimal.Decimal // e.g., 0.10 = 10%
-	ArbPositionSize    decimal.Decimal // USD per trade
-	ArbMaxDailyTrades  int
-	ArbCooldownSeconds int
+	ArbEnabled           bool
+	ArbMinPriceMove      decimal.Decimal // e.g., 0.002 = 0.2%
+	ArbMinOddsForEntry   decimal.Decimal // e.g., 0.35 = 35 cents (min entry)
+	ArbMaxOddsForEntry   decimal.Decimal // e.g., 0.65 = 65 cents (max entry)
+	ArbMinEdge           decimal.Decimal // e.g., 0.10 = 10%
+	ArbPositionSize      decimal.Decimal // USD per trade
+	ArbMaxDailyTrades    int
+	ArbMaxTradesPerWindow int            // Max trades per 15-min window
+	ArbCooldownSeconds   int
 
 	// Triple Exit Strategy
 	ArbExitOddsThreshold decimal.Decimal // e.g., 0.75 = exit at 75¢ for quick flip
@@ -89,14 +90,15 @@ FunderAddress:    os.Getenv("FUNDER_ADDRESS"),
 SignatureType:    getEnvInt("SIGNATURE_TYPE", 0),
 
 		// Arbitrage Settings
-		ArbEnabled:         getEnvBool("ARB_ENABLED", true),
-		ArbMinPriceMove:    getEnvDecimal("ARB_MIN_PRICE_MOVE", decimal.NewFromFloat(0.002)),
-		ArbMinOddsForEntry: getEnvDecimal("ARB_MIN_ODDS", decimal.NewFromFloat(0.35)),   // Min 35¢
-		ArbMaxOddsForEntry: getEnvDecimal("ARB_MAX_ODDS", decimal.NewFromFloat(0.65)),   // Max 65¢
-		ArbMinEdge:         getEnvDecimal("ARB_MIN_EDGE", decimal.NewFromFloat(0.10)),
-		ArbPositionSize:    getEnvDecimal("ARB_POSITION_SIZE", decimal.NewFromFloat(1)),
-		ArbMaxDailyTrades:  getEnvInt("ARB_MAX_DAILY_TRADES", 200),
-		ArbCooldownSeconds: getEnvInt("ARB_COOLDOWN_SECONDS", 10),
+		ArbEnabled:           getEnvBool("ARB_ENABLED", true),
+		ArbMinPriceMove:      getEnvDecimal("ARB_MIN_PRICE_MOVE", decimal.NewFromFloat(0.002)),
+		ArbMinOddsForEntry:   getEnvDecimal("ARB_MIN_ODDS", decimal.NewFromFloat(0.35)),   // Min 35¢
+		ArbMaxOddsForEntry:   getEnvDecimal("ARB_MAX_ODDS", decimal.NewFromFloat(0.65)),   // Max 65¢
+		ArbMinEdge:           getEnvDecimal("ARB_MIN_EDGE", decimal.NewFromFloat(0.10)),
+		ArbPositionSize:      getEnvDecimal("ARB_POSITION_SIZE", decimal.NewFromFloat(1)),
+		ArbMaxDailyTrades:    getEnvInt("ARB_MAX_DAILY_TRADES", 200),
+		ArbMaxTradesPerWindow: getEnvInt("ARB_MAX_TRADES_PER_WINDOW", 3),  // Max 3 trades per 15-min window
+		ArbCooldownSeconds:   getEnvInt("ARB_COOLDOWN_SECONDS", 10),
 
 		// Triple Exit Strategy
 		ArbExitOddsThreshold: getEnvDecimal("ARB_EXIT_ODDS", decimal.NewFromFloat(0.75)),       // Sell at 75¢+

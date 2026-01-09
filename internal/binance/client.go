@@ -330,12 +330,21 @@ func (c *Client) GetKlines(symbol, interval string, limit int) ([]Kline, error) 
 // This is used to get the "Price to Beat" for Polymarket windows
 // Returns the open price of the 1-second candle at the given timestamp
 func (c *Client) GetPriceAtTime(t time.Time) (decimal.Decimal, error) {
+	return c.GetAssetPriceAtTime("BTC", t)
+}
+
+// GetAssetPriceAtTime fetches any asset's price at a specific timestamp using 1-second klines
+// asset should be "BTC", "ETH", or "SOL"
+func (c *Client) GetAssetPriceAtTime(asset string, t time.Time) (decimal.Decimal, error) {
+	// Map asset to Binance symbol
+	symbol := asset + "USDT"
+	
 	// Convert to milliseconds for Binance API
 	startMs := t.Unix() * 1000
 	endMs := startMs + 1000 // Just 1 second
 	
-	url := fmt.Sprintf("%s/api/v3/klines?symbol=BTCUSDT&interval=1s&startTime=%d&endTime=%d&limit=1",
-		c.restURL, startMs, endMs)
+	url := fmt.Sprintf("%s/api/v3/klines?symbol=%s&interval=1s&startTime=%d&endTime=%d&limit=1",
+		c.restURL, symbol, startMs, endMs)
 	
 	resp, err := http.Get(url)
 	if err != nil {
