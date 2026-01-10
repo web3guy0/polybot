@@ -222,6 +222,11 @@ func main() {
 		engine := arbitrage.NewEngine(cfg, binanceClient, chainlinkClient, cmcClient, scanner)
 		engine.SetAsset(asset) // Tell engine which asset it's tracking
 		
+		// Wire up database for storing window prices
+		if db != nil {
+			engine.SetDatabase(db)
+		}
+		
 		// Wire up multi-asset Chainlink for Price to Beat
 		if multiChainlink != nil {
 			engine.SetMultiChainlink(multiChainlink)

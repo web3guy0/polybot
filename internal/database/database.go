@@ -160,6 +160,23 @@ func (ScalpTrade) TableName() string {
 	return "scalp_trades"
 }
 
+// WindowPrice stores the captured "Price to Beat" for each prediction window
+// This is captured at exact window start time and stored for later lookup
+type WindowPrice struct {
+	ID           uint            `gorm:"primaryKey;autoIncrement"`
+	WindowSlug   string          `gorm:"uniqueIndex"` // e.g., "btc-updown-15m-1768040100"
+	Asset        string          `gorm:"index"`       // BTC, ETH, SOL
+	PriceToBeat  decimal.Decimal `gorm:"type:decimal(20,6)"`
+	Source       string          // "chainlink", "binance", "cmc"
+	WindowStart  time.Time       `gorm:"index"`
+	CapturedAt   time.Time
+	CreatedAt    time.Time
+}
+
+func (WindowPrice) TableName() string {
+	return "window_prices"
+}
+
 func New(dbPath string) (*Database, error) {
 	var db *gorm.DB
 	var err error
@@ -190,7 +207,7 @@ func New(dbPath string) (*Database, error) {
 	}
 
 	// Auto migrate all models
-	if err := db.AutoMigrate(&Market{}, &Opportunity{}, &Trade{}, &ArbTrade{}, &Alert{}, &UserSettings{}); err != nil {
+	if err := db.AutoMigrate(&Market{}, &Opportunity{}, &Trade{}, &ArbTrade{}, &Alert{}, &UserSettings{}, &WindowPrice{}); err != nil {
 		return nil, err
 	}
 
@@ -516,4 +533,41 @@ func (d *Database) UpdateDailyStats(profit decimal.Decimal, asset string, won bo
 			updated_at = NOW()
 	`
 	return d.db.Exec(sql, today, winInt, loseInt, profit).Error
+}
+
+// WindowPrice operations - store/retrieve Price to Beat for prediction windows
+
+// SaveWindowPrice stores the captured price for a window (upsert)
+func (d *Database) SaveWindowPrice(wp *WindowPrice) error {
+	// Use upsert - if window slug already exists, don't overwrite
+	return d.db.Where("window_slug = ?", wp.WindowSlug).FirstOrCreate(wp).Error
+}
+
+// GetWindowPrice retrieves the stored price for a window by slug
+func (d *Database) GetWindowPrice(windowSlug string) (*WindowPrice, error) {
+	var wp WindowPrice
+	err := d.db.Where("window_slug = ?", windowSlug).First(&wp).Error
+	if err != nil {
+		return nil, err
+	}
+	return &wp, nil
+}
+
+// GetWindowPriceByAssetAndTime retrieves price by asset and approximate window start time
+func (d *Database) GetWindowPriceByAssetAndTime(asset string, windowStart time.Time) (*WindowPrice, error) {
+	var wp WindowPrice
+	// Allow 30 second tolerance for matching window start
+	startMin := windowStart.Add(-30 * time.Second)
+	startMax := windowStart.Add(30 * time.Second)
+	err := d.db.Where("asset = ? AND window_start BETWEEN ? AND ?", asset, startMin, startMax).First(&wp).Error
+	if err != nil {
+		return nil, err
+	}
+	return &wp, nil
+}
+
+// CleanOldWindowPrices removes window prices older than 24 hours
+func (d *Database) CleanOldWindowPrices() error {
+	cutoff := time.Now().Add(-24 * time.Hour)
+	return d.db.Where("window_start < ?", cutoff).Delete(&WindowPrice{}).Error
 }

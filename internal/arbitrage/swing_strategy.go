@@ -189,8 +189,16 @@ func (s *SwingStrategy) scan() {
 		// Record price for history tracking
 		s.scanner.RecordPrice(w.Asset, w.YesPrice, w.NoPrice)
 
+		// Get Price to Beat from engine's window state (stored in database)
+		priceToBeat := decimal.Zero
+		if s.engine != nil {
+			if state := s.engine.GetWindowState(w.ID); state != nil && !state.StartPrice.IsZero() {
+				priceToBeat = state.StartPrice
+			}
+		}
+
 		// Update dashboard with market data
-		s.updateMarketData(w.Asset, w.PriceToBeat, w.YesPrice, w.NoPrice)
+		s.updateMarketData(w.Asset, priceToBeat, w.YesPrice, w.NoPrice)
 
 		// Skip if we have position or cooldown
 		if s.hasPosition(w.Asset) || s.onCooldown(w.Asset) {
@@ -241,18 +249,11 @@ func (s *SwingStrategy) executeSignal(window polymarket.PredictionWindow, signal
 		tokenID = window.NoTokenID
 	}
 
-	// Calculate order price with slippage
+	// Calculate order price with slippage (for limit price)
 	orderPrice := signal.CurrentOdds.Add(s.config.BuySlippage)
 
-	// Place FOK order (Fill Or Kill for immediate execution)
-	order := Order{
-		TokenID:   tokenID,
-		Price:     orderPrice,
-		Size:      decimal.NewFromInt(size),
-		Side:      OrderSideBuy,
-		OrderType: OrderTypeFOK,
-	}
-	orderResp, err := s.clobClient.PlaceOrder(order)
+	// Use proper EIP-712 signed order (PlaceMarketBuyAtPrice for speed)
+	orderResp, err := s.clobClient.PlaceMarketBuyAtPrice(tokenID, decimal.NewFromInt(size), orderPrice)
 
 	if err != nil {
 		log.Error().Err(err).Str("asset", signal.Asset).Msg("❌ [SWING] Order failed")
@@ -417,15 +418,8 @@ func (s *SwingStrategy) exitPosition(pos *SwingPosition, window polymarket.Predi
 		sellPrice = decimal.NewFromFloat(0.01)
 	}
 
-	// Place FOK sell order
-	order := Order{
-		TokenID:   tokenID,
-		Price:     sellPrice,
-		Size:      decimal.NewFromInt(pos.Size),
-		Side:      OrderSideSell,
-		OrderType: OrderTypeFOK,
-	}
-	orderResp, err := s.clobClient.PlaceOrder(order)
+	// Use proper EIP-712 signed sell order
+	orderResp, err := s.clobClient.PlaceMarketSellAtPrice(tokenID, decimal.NewFromInt(pos.Size), sellPrice)
 
 	if err != nil {
 		log.Error().Err(err).Str("asset", pos.Asset).Msg("❌ [SWING] SELL order failed")

@@ -16,6 +16,7 @@ package arbitrage
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -26,6 +27,7 @@ import (
 	"github.com/web3guy0/polybot/internal/chainlink"
 	"github.com/web3guy0/polybot/internal/cmc"
 	"github.com/web3guy0/polybot/internal/config"
+	"github.com/web3guy0/polybot/internal/database"
 	"github.com/web3guy0/polybot/internal/polymarket"
 )
 
@@ -95,6 +97,7 @@ type OpenPosition struct {
 // Engine is the core latency arbitrage engine
 type Engine struct {
 	cfg             *config.Config
+	db              *database.Database // Database for storing window prices
 	binanceClient   *binance.Client
 	binanceMulti    *binance.MultiClient // Multi-asset Binance (BTC, ETH, SOL)
 	chainlinkClient *chainlink.Client // Chainlink price feed (what Polymarket uses for resolution)
@@ -279,6 +282,12 @@ func (e *Engine) SetWSClient(client *polymarket.WSClient) {
 	log.Info().Str("asset", e.asset).Msg("📡 Polymarket WebSocket connected to engine")
 }
 
+// SetDatabase sets the database for storing window prices
+func (e *Engine) SetDatabase(db *database.Database) {
+	e.db = db
+	log.Info().Str("asset", e.asset).Msg("💾 Database connected to engine")
+}
+
 // SetAsset sets the asset this engine tracks (BTC, ETH, SOL)
 func (e *Engine) SetAsset(asset string) {
 	e.asset = asset
@@ -392,8 +401,8 @@ func (e *Engine) Start() {
 	// Position monitor - check for exit opportunities every 100ms
 	go e.positionMonitorLoop()
 	
-	// Scheduled price capture - capture Price to Beat at exact T=0
-	go e.scheduledCaptureLoop()
+	// Note: Price to Beat is now stored in database when window first detected
+	// (see updateWindowStates - no longer need proactive capture loop)
 
 	log.Info().
 		Str("min_move", e.minPriceMove.Mul(decimal.NewFromInt(100)).String()+"%").
@@ -567,101 +576,96 @@ func (e *Engine) oddsRefreshLoop() {
 	}
 }
 
-// scheduledCaptureLoop watches for upcoming windows and captures Price to Beat at EXACT T=0
-// This eliminates the ~$100-150 error from late detection
+// scheduledCaptureLoop PROACTIVELY captures prices at :00, :15, :30, :45 
+// Polymarket windows aren't published until AFTER they start, so we predict start times
+// and capture Chainlink+CMC+Binance prices at exact T=0
 func (e *Engine) scheduledCaptureLoop() {
-	ticker := time.NewTicker(1 * time.Second)
+	ticker := time.NewTicker(100 * time.Millisecond) // Check every 100ms for precision
 	defer ticker.Stop()
+	
+	var lastCaptureMinute int = -1 // Track which minute we last captured
 	
 	for {
 		select {
 		case <-ticker.C:
-			e.checkUpcomingWindows()
-			e.executePendingCaptures()
+			now := time.Now()
+			minute := now.Minute()
+			second := now.Second()
+			
+			// Capture at :00, :15, :30, :45 (within first 2 seconds of window start)
+			isWindowStart := (minute%15 == 0) && second < 2
+			
+			// Only capture once per window start
+			if isWindowStart && minute != lastCaptureMinute {
+				lastCaptureMinute = minute
+				e.captureAtWindowStart(now)
+			}
+			
 		case <-e.stopCh:
 			return
 		}
 	}
 }
 
-// checkUpcomingWindows looks for windows about to start and schedules price capture
-func (e *Engine) checkUpcomingWindows() {
-	windows := e.windowScanner.GetActiveWindows()
-	now := time.Now()
-	
-	for _, w := range windows {
-		// Look for windows starting in the next 30 seconds
-		timeUntilStart := w.StartDate.Sub(now)
-		
-		if timeUntilStart > 0 && timeUntilStart <= 30*time.Second {
-			e.capturesMu.Lock()
-			if _, scheduled := e.scheduledCaptures[w.ID]; !scheduled {
-				e.scheduledCaptures[w.ID] = w.StartDate
-				log.Info().
-					Str("asset", e.GetAsset()).
-					Str("window", truncate(w.Question, 40)).
-					Str("starts_in", timeUntilStart.Round(time.Second).String()).
-					Msg("⏰ Scheduled price capture for upcoming window")
-			}
-			e.capturesMu.Unlock()
-		}
-	}
-}
-
-// executePendingCaptures checks if any scheduled captures should fire
-func (e *Engine) executePendingCaptures() {
-	now := time.Now()
+// captureAtWindowStart captures prices at exact T=0 for the starting window
+// Stores prices keyed by predicted window slug for later lookup
+func (e *Engine) captureAtWindowStart(captureTime time.Time) {
 	asset := e.GetAsset()
 	
-	e.capturesMu.Lock()
-	defer e.capturesMu.Unlock()
+	// Get prices from all sources simultaneously
+	var cmcPrice, chainlinkPrice, binancePrice decimal.Decimal
 	
-	for windowID, captureTime := range e.scheduledCaptures {
-		// Fire capture when we're within 1 second of the scheduled time
-		timeDiff := now.Sub(captureTime)
-		if timeDiff >= -500*time.Millisecond && timeDiff <= 2*time.Second {
-			// CAPTURE NOW! Get price from all sources
-			var cmcPrice, chainlinkPrice, binancePrice decimal.Decimal
-			
-			if e.cmcClient != nil {
-				cmcPrice = e.cmcClient.GetAssetPrice(asset)
-			}
-			if e.multiChainlink != nil {
-				chainlinkPrice = e.multiChainlink.GetPrice(asset)
-			}
-			if e.binanceMulti != nil {
-				binancePrice = e.binanceMulti.GetPrice(asset)
-			}
-			
-			// Use CMC as primary, average with Chainlink if both available
-			var capturedPrice decimal.Decimal
-			if !cmcPrice.IsZero() && !chainlinkPrice.IsZero() {
-				// Average for accuracy
-				capturedPrice = cmcPrice.Add(chainlinkPrice).Div(decimal.NewFromInt(2))
-			} else if !cmcPrice.IsZero() {
-				capturedPrice = cmcPrice
-			} else if !chainlinkPrice.IsZero() {
-				capturedPrice = chainlinkPrice
-			} else if !binancePrice.IsZero() {
-				capturedPrice = binancePrice
-			}
-			
-			if !capturedPrice.IsZero() {
-				e.capturedPrices[windowID] = capturedPrice
-				log.Info().
-					Str("asset", asset).
-					Str("window_id", windowID).
-					Str("price_to_beat", capturedPrice.StringFixed(2)).
-					Str("cmc", cmcPrice.StringFixed(2)).
-					Str("chainlink", chainlinkPrice.StringFixed(2)).
-					Str("binance", binancePrice.StringFixed(2)).
-					Msg("🎯 CAPTURED Price to Beat at T=0!")
-			}
-			
-			// Remove from scheduled
-			delete(e.scheduledCaptures, windowID)
-		}
+	if e.cmcClient != nil {
+		cmcPrice = e.cmcClient.GetAssetPrice(asset)
 	}
+	if e.multiChainlink != nil {
+		chainlinkPrice = e.multiChainlink.GetPrice(asset)
+	}
+	if e.binanceMulti != nil {
+		binancePrice = e.binanceMulti.GetPrice(asset)
+	}
+	
+	// Calculate captured price (Chainlink is what Polymarket actually uses!)
+	var capturedPrice decimal.Decimal
+	if !chainlinkPrice.IsZero() {
+		// Chainlink is the SOURCE OF TRUTH for Polymarket resolution
+		capturedPrice = chainlinkPrice
+	} else if !cmcPrice.IsZero() {
+		capturedPrice = cmcPrice
+	} else if !binancePrice.IsZero() {
+		capturedPrice = binancePrice
+	}
+	
+	if capturedPrice.IsZero() {
+		log.Warn().Str("asset", asset).Msg("⚠️ Failed to capture price at T=0")
+		return
+	}
+	
+	// Generate window slug for this capture (used to match with Polymarket windows)
+	// Windows use 15-minute intervals aligned to Unix time
+	windowTs := (captureTime.Unix() / 900) * 900
+	windowSlug := fmt.Sprintf("%s-updown-15m-%d", strings.ToLower(asset), windowTs)
+	
+	e.capturesMu.Lock()
+	e.capturedPrices[windowSlug] = capturedPrice
+	e.capturesMu.Unlock()
+	
+	log.Info().
+		Str("asset", asset).
+		Str("window_slug", windowSlug).
+		Str("price_to_beat", capturedPrice.StringFixed(2)).
+		Str("chainlink", chainlinkPrice.StringFixed(2)).
+		Str("cmc", cmcPrice.StringFixed(2)).
+		Str("binance", binancePrice.StringFixed(2)).
+		Msg("🎯 CAPTURED Price to Beat at T=0!")
+}
+
+// getCapturedPrice retrieves a pre-captured price for a window
+func (e *Engine) getCapturedPrice(windowSlug string) (decimal.Decimal, bool) {
+	e.capturesMu.RLock()
+	defer e.capturesMu.RUnlock()
+	price, ok := e.capturedPrices[windowSlug]
+	return price, ok
 }
 
 // positionMonitorLoop monitors open positions for exit opportunities every 100ms
@@ -1020,25 +1024,61 @@ func (e *Engine) updateWindowStates() {
 		if _, exists := e.windowStates[w.ID]; !exists {
 			// NEW WINDOW DETECTED - Get "Price to Beat"
 			asset := e.GetAsset()
-			windowAge := time.Since(w.StartDate)
 			var startPrice decimal.Decimal
 			var priceSource string
-			var cmcPrice, chainlinkPrice, binancePrice decimal.Decimal
 			
-			// PRIORITY 0: Check if we pre-captured this price at EXACT T=0
-			e.capturesMu.RLock()
-			if capturedPrice, hasCaptured := e.capturedPrices[w.ID]; hasCaptured {
-				startPrice = capturedPrice
-				priceSource = "Pre-captured at T=0"
-				log.Info().
-					Str("asset", asset).
-					Str("price_to_beat", startPrice.StringFixed(2)).
-					Msg("✅ Using pre-captured Price to Beat (exact T=0)")
+			// PRIORITY 1: Check database for stored price (from when we first saw this window)
+			if e.db != nil && w.Slug != "" {
+				if stored, err := e.db.GetWindowPrice(w.Slug); err == nil && stored != nil {
+					startPrice = stored.PriceToBeat
+					priceSource = "Database (captured at first detection)"
+					log.Info().
+						Str("asset", asset).
+						Str("slug", w.Slug).
+						Str("price_to_beat", startPrice.StringFixed(2)).
+						Str("captured_at", stored.CapturedAt.Format("15:04:05")).
+						Msg("✅ Using stored Price to Beat from database")
+				}
 			}
-			e.capturesMu.RUnlock()
+			
+			// PRIORITY 2: If not in DB, capture current price and store it NOW
+			if startPrice.IsZero() {
+				// Get Chainlink price (what Polymarket uses for resolution!)
+				if e.multiChainlink != nil {
+					startPrice = e.multiChainlink.GetPrice(asset)
+					priceSource = "Chainlink"
+				}
+				
+				// Fallback to Binance
+				if startPrice.IsZero() && e.binanceMulti != nil {
+					startPrice = e.binanceMulti.GetPrice(asset)
+					priceSource = "Binance"
+				}
+				
+				// Store in database for persistence
+				if !startPrice.IsZero() && e.db != nil && w.Slug != "" {
+					wp := &database.WindowPrice{
+						WindowSlug:  w.Slug,
+						Asset:       asset,
+						PriceToBeat: startPrice,
+						Source:      priceSource,
+						WindowStart: w.StartDate,
+						CapturedAt:  time.Now(),
+					}
+					if err := e.db.SaveWindowPrice(wp); err != nil {
+						log.Warn().Err(err).Str("slug", w.Slug).Msg("Failed to save window price to DB")
+					} else {
+						log.Info().
+							Str("asset", asset).
+							Str("slug", w.Slug).
+							Str("price_to_beat", startPrice.StringFixed(2)).
+							Str("source", priceSource).
+							Msg("💾 Stored Price to Beat in database")
+					}
+				}
+			}
 			
 			// CAPTURE POLYMARKET ODDS AT WINDOW START
-			// This is THE most important data - market's implied probability at T=0
 			var startUpOdds, startDownOdds decimal.Decimal
 			
 			// Try WebSocket first (real-time)
@@ -1054,70 +1094,6 @@ func (e *Engine) updateWindowStates() {
 			if startUpOdds.IsZero() {
 				startUpOdds = w.YesPrice
 				startDownOdds = w.NoPrice
-			}
-			
-			// If not pre-captured, use parallel snapshot
-			if startPrice.IsZero() {
-				// Collect parallel snapshots from ALL sources
-				if e.cmcClient != nil {
-					cmcPrice = e.cmcClient.GetAssetPrice(asset)
-				}
-				if e.multiChainlink != nil {
-					chainlinkPrice = e.multiChainlink.GetPrice(asset)
-				}
-				// Use multi-asset Binance for all assets
-				if e.binanceMulti != nil {
-					binancePrice = e.binanceMulti.GetPrice(asset)
-				} else if e.binanceClient != nil && asset == "BTC" {
-					binancePrice = e.binanceClient.GetCurrentPrice()
-				}
-				
-				// FRESH WINDOWS (<15s): Use CMC as primary, cross-validate with others
-				if windowAge <= 15*time.Second {
-					if !cmcPrice.IsZero() {
-						startPrice = cmcPrice
-						priceSource = "CMC (parallel snapshot)"
-						
-						// Log cross-validation for debugging
-						log.Info().
-							Str("asset", asset).
-							Str("window_age", windowAge.Round(time.Second).String()).
-							Str("cmc", cmcPrice.StringFixed(2)).
-							Str("chainlink", chainlinkPrice.StringFixed(2)).
-							Str("binance", binancePrice.StringFixed(2)).
-							Str("price_to_beat", startPrice.StringFixed(2)).
-							Msg("🎯 FRESH WINDOW - Parallel snapshot captured!")
-					}
-				} else if windowAge <= 30*time.Second {
-					// SLIGHTLY STALE (15-30s): Still usable, use average for better accuracy
-					if !cmcPrice.IsZero() && !chainlinkPrice.IsZero() {
-						// Average of CMC and Chainlink for stability
-						startPrice = cmcPrice.Add(chainlinkPrice).Div(decimal.NewFromInt(2))
-						priceSource = "Avg(CMC+Chainlink)"
-						log.Info().
-							Str("asset", asset).
-							Str("window_age", windowAge.Round(time.Second).String()).
-							Str("price_to_beat", startPrice.StringFixed(2)).
-							Msg("📊 Near-fresh window - using averaged price")
-					} else if !cmcPrice.IsZero() {
-						startPrice = cmcPrice
-						priceSource = "CMC (near-fresh)"
-					}
-				} else {
-					// TOO STALE (>30s): Skip - can't reliably know Price to Beat
-					log.Debug().
-						Str("asset", asset).
-						Str("window_age", windowAge.Round(time.Second).String()).
-						Str("window", truncate(w.Question, 40)).
-						Msg("⏭️ Skipping stale window - Price to Beat unknown")
-					continue
-				}
-			}
-			
-			// Fallback to Chainlink current if nothing else
-			if startPrice.IsZero() && !chainlinkPrice.IsZero() {
-				startPrice = chainlinkPrice
-				priceSource = "Chainlink Current"
 			}
 			
 			// Skip if we still don't have a start price

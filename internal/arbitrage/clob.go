@@ -377,13 +377,13 @@ func (c *CLOBClient) PlaceOrder(order Order) (*OrderResponse, error) {
 
 	respBody, _ := io.ReadAll(resp.Body)
 
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		return nil, fmt.Errorf("order failed (HTTP %d): %s", resp.StatusCode, string(respBody))
+	}
+
 	var orderResp OrderResponse
 	if err := json.Unmarshal(respBody, &orderResp); err != nil {
 		return nil, fmt.Errorf("failed to parse response: %w, body: %s", err, string(respBody))
-	}
-
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		return &orderResp, fmt.Errorf("order failed: %s - %s", orderResp.ErrorCode, orderResp.Message)
 	}
 
 	return &orderResp, nil

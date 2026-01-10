@@ -230,11 +230,15 @@ func (s *ScalperStrategy) checkWindows() {
 		s.mu.Unlock()
 
 		// Update dashboard with prices
-		// Use PriceToBeat from window if available!
+		// Use pre-captured Price to Beat from engine (not from Polymarket API - they don't expose it!)
 		binPrice := decimal.Zero
-		priceToBeat := w.PriceToBeat // From Polymarket API
+		priceToBeat := decimal.Zero
 		if s.engine != nil {
 			binPrice = s.engine.GetCurrentPrice()
+			// Get price to beat from our captured window state
+			if state := s.engine.GetWindowState(w.ID); state != nil && !state.StartPrice.IsZero() {
+				priceToBeat = state.StartPrice
+			}
 		}
 		s.dashUpdatePrices(asset, binPrice, priceToBeat, w.YesPrice, w.NoPrice)
 
@@ -245,6 +249,7 @@ func (s *ScalperStrategy) checkWindows() {
 				Bool("has_position", hasPos).
 				Int("total_positions", numPositions).
 				Str("price_to_beat", priceToBeat.StringFixed(2)).
+				Str("window_id", w.ID).
 				Msg("📊 [SCALP] Position check")
 		}
 
