@@ -35,14 +35,18 @@ import (
 	"github.com/web3guy0/polybot/internal/polymarket"
 )
 
-const version = "4.0.0"
+const version = "5.0.0" // Mean Reversion Swing Trading
 
 func main() {
 	// Check for dashboard mode FIRST (before setting up zerolog)
 	useDashboard := false
+	useSwing := false // New: Mean reversion swing trading
 	for _, arg := range os.Args[1:] {
 		if arg == "--dashboard" || arg == "-d" {
 			useDashboard = true
+		}
+		if arg == "--swing" || arg == "-s" {
+			useSwing = true
 		}
 	}
 
@@ -225,26 +229,51 @@ func main() {
 		log.Info().Str("asset", asset).Msg("⚡ Arbitrage engine started")
 	}
 
+	// ====== SWING STRATEGY (Mean Reversion) ======
+	// Buy the dip (12¢+ drop), sell the bounce (+6¢ profit)
+	// Trades volatility, not window resolution
+	var swingStrategies []*arbitrage.SwingStrategy
+	if useSwing {
+		swingStrategies = make([]*arbitrage.SwingStrategy, 0, len(assets))
+		for i, asset := range assets {
+			swing := arbitrage.NewSwingStrategy(
+				windowScanners[i],
+				clobClient,
+				db,
+			)
+			swing.SetNotifier(nil) // Will set after telegram init
+			if proDash != nil {
+				swing.SetDashboard(proDash)
+			}
+			swing.Start()
+			swingStrategies = append(swingStrategies, swing)
+			log.Info().Str("asset", asset).Msg("🎢 Swing strategy started (mean reversion)")
+		}
+	}
+
 	// ====== SCALPER STRATEGY ======
 	// Buy extreme mispricings (<20¢) and sell when they bounce to 33¢+
 	// CRITICAL: Uses engine's price-to-beat data to avoid late entries!
-	scalperStrategies := make([]*arbitrage.ScalperStrategy, 0, len(assets))
-	for i, asset := range assets {
-		scalper := arbitrage.NewScalperStrategy(
-			windowScanners[i], 
-			clobClient, 
-			cfg.DryRun,
-			cfg.ScalperPositionSize,    // Position size from config
-		)
-		// Link scalper to engine for price-to-beat data
-		scalper.SetEngine(arbEngines[i])
-		// Connect to database for trade logging
-		if db != nil {
-			scalper.SetDatabase(db)
+	var scalperStrategies []*arbitrage.ScalperStrategy
+	if !useSwing {
+		scalperStrategies = make([]*arbitrage.ScalperStrategy, 0, len(assets))
+		for i, asset := range assets {
+			scalper := arbitrage.NewScalperStrategy(
+				windowScanners[i], 
+				clobClient, 
+				cfg.DryRun,
+				cfg.ScalperPositionSize,    // Position size from config
+			)
+			// Link scalper to engine for price-to-beat data
+			scalper.SetEngine(arbEngines[i])
+			// Connect to database for trade logging
+			if db != nil {
+				scalper.SetDatabase(db)
+			}
+			scalper.Start()
+			scalperStrategies = append(scalperStrategies, scalper)
+			log.Info().Str("asset", asset).Bool("paper", cfg.DryRun).Msg("🎯 Scalper strategy started")
 		}
-		scalper.Start()
-		scalperStrategies = append(scalperStrategies, scalper)
-		log.Info().Str("asset", asset).Bool("paper", cfg.DryRun).Msg("🎯 Scalper strategy started")
 	}
 	
 	// Subscribe to WebSocket markets for all active windows
@@ -268,16 +297,24 @@ func main() {
 		log.Fatal().Err(err).Msg("Failed to initialize Telegram bot")
 	}
 	
-	// Register engines and scalpers for each asset
+	// Register engines and strategies for each asset
 	// Also connect telegram as notifier for trade alerts
 	for i, asset := range assets {
 		telegramBot.AddEngine(asset, arbEngines[i])
-		telegramBot.AddScalper(asset, scalperStrategies[i])
-		scalperStrategies[i].SetNotifier(telegramBot) // Connect Telegram for alerts
 		
-		// Connect professional dashboard to scalper
-		if proDash != nil {
-			scalperStrategies[i].SetProDashboard(proDash)
+		if useSwing && i < len(swingStrategies) {
+			// Using swing strategy
+			swingStrategies[i].SetNotifier(telegramBot)
+			if proDash != nil {
+				swingStrategies[i].SetDashboard(proDash)
+			}
+		} else if !useSwing && i < len(scalperStrategies) {
+			// Using scalper strategy
+			telegramBot.AddScalper(asset, scalperStrategies[i])
+			scalperStrategies[i].SetNotifier(telegramBot)
+			if proDash != nil {
+				scalperStrategies[i].SetProDashboard(proDash)
+			}
 		}
 	}
 
@@ -291,19 +328,35 @@ func main() {
 	// ====== STARTUP COMPLETE ======
 	log.Info().Msg("✅ All systems online")
 	log.Info().Msg("")
-	log.Info().Msg("╔══════════════════════════════════════════╗")
-	log.Info().Msg("║   MULTI-ASSET LATENCY ARBITRAGE ACTIVE   ║")
-	log.Info().Msg("║                                          ║")
-	log.Info().Msg("║  Strategy: Exploit price→odds lag       ║")
-	log.Info().Msg("║                                          ║")
-	log.Info().Msgf("║  Assets: %-32s ║", formatAssets(assets))
-	log.Info().Msg("║  → Watch for price moves on CMC          ║")
-	log.Info().Msg("║  → Buy stale Polymarket odds             ║")
-	log.Info().Msg("║  → Exit at 75¢ OR hold to resolution     ║")
-	log.Info().Msg("║                                          ║")
-	log.Info().Msg("║  🚀 Dynamic Sizing: 1x/2x/3x by move     ║")
-	log.Info().Msg("║  🎯 Scalper: Buy cheap, sell on bounce   ║")
-	log.Info().Msg("╚══════════════════════════════════════════╝")
+	if useSwing {
+		log.Info().Msg("╔══════════════════════════════════════════╗")
+		log.Info().Msg("║   🎢 MEAN REVERSION SWING TRADING 🎢      ║")
+		log.Info().Msg("║                                          ║")
+		log.Info().Msg("║  Strategy: Buy dips, sell bounces        ║")
+		log.Info().Msg("║                                          ║")
+		log.Info().Msgf("║  Assets: %-32s ║", formatAssets(assets))
+		log.Info().Msg("║  → Track odds history (30s lookback)     ║")
+		log.Info().Msg("║  → Buy when odds drop 12¢+ quickly       ║")
+		log.Info().Msg("║  → Sell on 50% retracement bounce        ║")
+		log.Info().Msg("║                                          ║")
+		log.Info().Msg("║  📈 Entry: 8¢-65¢ range only            ║")
+		log.Info().Msg("║  🎯 Exit: Bounce target / Stop loss      ║")
+		log.Info().Msg("╚══════════════════════════════════════════╝")
+	} else {
+		log.Info().Msg("╔══════════════════════════════════════════╗")
+		log.Info().Msg("║   MULTI-ASSET LATENCY ARBITRAGE ACTIVE   ║")
+		log.Info().Msg("║                                          ║")
+		log.Info().Msg("║  Strategy: Exploit price→odds lag        ║")
+		log.Info().Msg("║                                          ║")
+		log.Info().Msgf("║  Assets: %-32s ║", formatAssets(assets))
+		log.Info().Msg("║  → Watch for price moves on CMC          ║")
+		log.Info().Msg("║  → Buy stale Polymarket odds             ║")
+		log.Info().Msg("║  → Exit at 75¢ OR hold to resolution     ║")
+		log.Info().Msg("║                                          ║")
+		log.Info().Msg("║  🚀 Dynamic Sizing: 1x/2x/3x by move     ║")
+		log.Info().Msg("║  🎯 Scalper: Buy cheap, sell on bounce   ║")
+		log.Info().Msg("╚══════════════════════════════════════════╝")
+	}
 	log.Info().Msg("")
 	log.Info().Msg("💡 Use /help for commands")
 
