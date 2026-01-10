@@ -599,9 +599,10 @@ func (c *CLOBClient) PlaceLimitOrder(tokenID string, price, size decimal.Decimal
 		Str("price", price.String()).
 		Msg("⚡ Order signed (native Go)")
 
-	// Submit as FOK (Fill Or Kill) - must fill immediately or cancel
-	// This prevents unfilled orders sitting on book while bot thinks it has position
-	resp, err := c.submitSignedOrderWithType(signedOrder, "FOK")
+	// Submit as FAK (Fill And Kill) - fills what it can immediately, cancels rest
+	// Better than FOK because it allows partial fills
+	// Better than GTC because unfilled portion is cancelled (no ghost orders)
+	resp, err := c.submitSignedOrderWithType(signedOrder, "FAK")
 	if err != nil {
 		return "", err
 	}
@@ -616,8 +617,8 @@ func (c *CLOBClient) PlaceLimitOrder(tokenID string, price, size decimal.Decimal
 		Str("price", price.String()).
 		Str("size", size.String()).
 		Str("side", side).
-		Str("type", "FOK").
-		Msg("📋 Order placed (Fill-Or-Kill)")
+		Str("type", "FAK").
+		Msg("📋 Order placed (Fill-And-Kill)")
 
 	return resp.OrderID, nil
 }
