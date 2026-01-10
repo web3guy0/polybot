@@ -39,7 +39,8 @@ type ScalperStrategy struct {
 	engine        *Engine // Reference to engine for price-to-beat data
 	db            *database.Database // Database for trade logging
 	notifier      TradeNotifier // For Telegram alerts
-	dash          *dashboard.Dashboard // For live terminal dashboard
+	dash          *dashboard.Dashboard // For live terminal dashboard (legacy)
+	proDash       *dashboard.ProDashboard // Professional terminal dashboard
 	
 	// ML-powered dynamic thresholds (legacy)
 	dynamicThreshold *DynamicThreshold
@@ -155,10 +156,16 @@ func (s *ScalperStrategy) SetNotifier(n TradeNotifier) {
 	log.Info().Msg("📱 [SCALP] Notifier connected for trade alerts")
 }
 
-// SetDashboard sets the live terminal dashboard
+// SetDashboard sets the live terminal dashboard (legacy)
 func (s *ScalperStrategy) SetDashboard(d *dashboard.Dashboard) {
 	s.dash = d
 	log.Info().Msg("📺 [SCALP] Dashboard connected for live UI")
+}
+
+// SetProDashboard sets the professional terminal dashboard
+func (s *ScalperStrategy) SetProDashboard(d *dashboard.ProDashboard) {
+	s.proDash = d
+	log.Info().Msg("📺 [SCALP] Professional dashboard connected")
 }
 
 // EnableML enables/disables ML-powered dynamic thresholds
@@ -1300,64 +1307,75 @@ func truncateQuestion(q string) string {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// DASHBOARD HELPERS
+// DASHBOARD HELPERS - Works with both legacy and Pro dashboards
 // ═══════════════════════════════════════════════════════════════════════
 
 // dashUpdatePosition updates the dashboard with current position state
 func (s *ScalperStrategy) dashUpdatePosition(pos *ScalpPosition, currentPrice decimal.Decimal, status string) {
-	if s.dash == nil {
-		return
+	if s.proDash != nil {
+		s.proDash.UpdatePosition(pos.Asset, pos.Side, pos.EntryPrice, currentPrice, pos.Size, status)
+	} else if s.dash != nil {
+		s.dash.UpdatePosition(pos.Asset, pos.Side, pos.EntryPrice, currentPrice, pos.Size, status)
 	}
-	s.dash.UpdatePosition(pos.Asset, pos.Side, pos.EntryPrice, currentPrice, pos.Size, status)
 }
 
 // dashRemovePosition removes a position from dashboard
 func (s *ScalperStrategy) dashRemovePosition(asset string) {
-	if s.dash == nil {
-		return
+	if s.proDash != nil {
+		s.proDash.RemovePosition(asset)
+	} else if s.dash != nil {
+		s.dash.RemovePosition(asset)
 	}
-	s.dash.RemovePosition(asset)
 }
 
 // dashAddTrade logs a trade to dashboard
 func (s *ScalperStrategy) dashAddTrade(asset, action string, price decimal.Decimal, size int64, pnl decimal.Decimal, result string) {
-	if s.dash == nil {
-		return
+	if s.proDash != nil {
+		s.proDash.AddLog(fmt.Sprintf("%s %s %s @ %s¢ x%d %s", result, action, asset, price.Mul(decimal.NewFromInt(100)).StringFixed(0), size, pnl.StringFixed(2)))
+	} else if s.dash != nil {
+		s.dash.AddTrade(asset, action, price, size, pnl, result)
 	}
-	s.dash.AddTrade(asset, action, price, size, pnl, result)
 }
 
 // dashUpdateStats updates overall stats on dashboard
 func (s *ScalperStrategy) dashUpdateStats() {
-	if s.dash == nil {
-		return
-	}
 	s.mu.RLock()
-	balance := decimal.Zero // TODO: Get from CLOB client
-	s.dash.UpdateStats(s.totalTrades, s.winningTrades, s.totalProfit, balance)
+	balance := decimal.Zero
+	totalTrades := s.totalTrades
+	winningTrades := s.winningTrades
+	totalProfit := s.totalProfit
 	s.mu.RUnlock()
+	
+	if s.proDash != nil {
+		s.proDash.UpdateStats(totalTrades, winningTrades, totalProfit, balance)
+	} else if s.dash != nil {
+		s.dash.UpdateStats(totalTrades, winningTrades, totalProfit, balance)
+	}
 }
 
 // dashUpdatePrices updates price display on dashboard
-func (s *ScalperStrategy) dashUpdatePrices(asset string, binPrice, clPrice, upOdds, downOdds decimal.Decimal) {
-	if s.dash == nil {
-		return
+func (s *ScalperStrategy) dashUpdatePrices(asset string, binPrice, priceToBeat, upOdds, downOdds decimal.Decimal) {
+	if s.proDash != nil {
+		s.proDash.UpdateMarket(asset, binPrice, priceToBeat, upOdds, downOdds)
+	} else if s.dash != nil {
+		s.dash.UpdatePrice(asset, binPrice, priceToBeat, upOdds, downOdds)
 	}
-	s.dash.UpdatePrice(asset, binPrice, clPrice, upOdds, downOdds)
 }
 
 // dashLog logs a message to dashboard
 func (s *ScalperStrategy) dashLog(msg string) {
-	if s.dash == nil {
-		return
+	if s.proDash != nil {
+		s.proDash.AddLog(msg)
+	} else if s.dash != nil {
+		s.dash.AddLog(msg)
 	}
-	s.dash.AddLog(msg)
 }
 
-// dashAddOpportunity logs an opportunity to dashboard
+// dashAddOpportunity logs an opportunity/signal to dashboard
 func (s *ScalperStrategy) dashAddOpportunity(asset, side string, price, probability decimal.Decimal, signal, reason string) {
-	if s.dash == nil {
-		return
+	if s.proDash != nil {
+		s.proDash.AddSignal(asset, side, price, probability, signal)
+	} else if s.dash != nil {
+		s.dash.AddOpportunity(asset, side, price, probability, signal, reason)
 	}
-	s.dash.AddOpportunity(asset, side, price, probability, signal, reason)
 }

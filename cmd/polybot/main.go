@@ -46,17 +46,17 @@ func main() {
 		}
 	}
 
-	// Create dashboard early (even if not used, for nil safety)
-	var dash *dashboard.Dashboard
+	// Create professional dashboard (institutional grade)
+	var proDash *dashboard.ProDashboard
 	if useDashboard {
-		dash = dashboard.New()
+		proDash = dashboard.NewProDashboard()
 	}
 
 	// Setup logging - route to dashboard if enabled
-	if useDashboard && dash != nil {
+	if useDashboard && proDash != nil {
 		// Silent mode - logs go to dashboard
 		zerolog.SetGlobalLevel(zerolog.InfoLevel)
-		log.Logger = log.Output(dash.Writer())
+		log.Logger = log.Output(proDash.Writer())
 	} else {
 		// Normal console logging
 		log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr})
@@ -275,17 +275,17 @@ func main() {
 		telegramBot.AddScalper(asset, scalperStrategies[i])
 		scalperStrategies[i].SetNotifier(telegramBot) // Connect Telegram for alerts
 		
-		// Connect dashboard to scalper
-		if dash != nil {
-			scalperStrategies[i].SetDashboard(dash)
+		// Connect professional dashboard to scalper
+		if proDash != nil {
+			scalperStrategies[i].SetProDashboard(proDash)
 		}
 	}
 
 	go telegramBot.Start()
 	
-	// Start dashboard if enabled
-	if dash != nil {
-		dash.Start()
+	// Start professional dashboard if enabled
+	if proDash != nil {
+		proDash.Start()
 	}
 
 	// ====== STARTUP COMPLETE ======
@@ -321,9 +321,9 @@ func main() {
 	// Graceful shutdown
 	log.Info().Msg("Shutting down...")
 
-	// Stop dashboard first
-	if dash != nil {
-		dash.Stop()
+	// Stop professional dashboard first
+	if proDash != nil {
+		proDash.Stop()
 	}
 	
 	telegramBot.Stop()
