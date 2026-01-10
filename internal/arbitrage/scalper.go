@@ -41,9 +41,12 @@ type ScalperStrategy struct {
 	notifier      TradeNotifier // For Telegram alerts
 	dash          *dashboard.Dashboard // For live terminal dashboard
 	
-	// ML-powered dynamic thresholds
+	// ML-powered dynamic thresholds (legacy)
 	dynamicThreshold *DynamicThreshold
 	useML            bool // Enable intelligent mode
+	
+	// NEW: Smart probability model
+	probModel *ProbabilityModel
 	
 	// Configuration (fallback if ML disabled)
 	entryThreshold decimal.Decimal // Buy when price drops to this (e.g., 0.20)
@@ -130,6 +133,8 @@ func NewScalperStrategy(scanner *polymarket.WindowScanner, clobClient *CLOBClien
 		// Initialize ML-powered dynamic thresholds
 		dynamicThreshold: NewDynamicThreshold(baseEntry, baseProfit, baseStop),
 		useML:            true, // Enable intelligent mode by default
+		// NEW: Smart probability model
+		probModel:        NewProbabilityModel(),
 	}
 }
 
@@ -274,7 +279,75 @@ func (s *ScalperStrategy) findScalpOpportunity(w *polymarket.PredictionWindow) {
 	}
 
 	// ═══════════════════════════════════════════════════════════════════════
-	// ML-POWERED INTELLIGENT ANALYSIS (if enabled)
+	// SMART PROBABILITY MODEL - The brain of our trading!
+	// ═══════════════════════════════════════════════════════════════════════
+	
+	// Get price data
+	priceToBeat := w.PriceToBeat
+	currentPrice := decimal.Zero
+	momentum := 0.0
+	
+	if s.engine != nil {
+		currentPrice = s.engine.GetCurrentPrice()
+		
+		// Fall back to engine's tracked start price if no PriceToBeat
+		if priceToBeat.IsZero() {
+			if state := s.engine.GetWindowState(w.ID); state != nil {
+				priceToBeat = state.StartPrice
+			}
+		}
+		
+		// Record price for volatility tracking
+		if !currentPrice.IsZero() {
+			s.dynamicThreshold.GetCollector(asset).RecordPrice(currentPrice)
+			// TODO: Calculate momentum from price history
+		}
+	}
+	
+	// Use the probability model to decide
+	if s.probModel != nil && !priceToBeat.IsZero() && !currentPrice.IsZero() {
+		decision := s.probModel.Analyze(
+			asset,
+			priceToBeat,
+			currentPrice,
+			upPrice,
+			downPrice,
+			timeRemaining,
+			momentum,
+		)
+		
+		if decision.ShouldTrade {
+			// Model says GO!
+			s.dashAddOpportunity(asset, decision.Side, decision.MarketPrice, decimal.NewFromFloat(decision.WinProb), "🧠 BUY", decision.Reason)
+			
+			log.Info().
+				Str("asset", asset).
+				Str("side", decision.Side).
+				Str("market_price", decision.MarketPrice.StringFixed(2)).
+				Str("fair_price", decision.FairPrice.StringFixed(2)).
+				Str("edge", decision.Edge.Mul(decimal.NewFromInt(100)).StringFixed(0)+"¢").
+				Float64("win_prob", decision.WinProb).
+				Str("ev", decision.ExpectedValue.Mul(decimal.NewFromInt(100)).StringFixed(1)+"%").
+				Str("risk", decision.RiskLevel).
+				Msg("🧠 [PROB] SMART ENTRY!")
+			
+			// Execute the trade with model's recommendation
+			s.executeSmartEntry(w, &decision)
+			return
+		} else {
+			// Model says NO
+			log.Debug().
+				Str("asset", asset).
+				Str("up", upPrice.String()).
+				Str("down", downPrice.String()).
+				Str("reason", decision.Reason).
+				Msg("🧠 [PROB] No opportunity")
+			return
+		}
+	}
+	
+	// ═══════════════════════════════════════════════════════════════════════
+	// FALLBACK: Legacy ML analysis if probability model can't run
 	// ═══════════════════════════════════════════════════════════════════════
 	s.mu.RLock()
 	useML := s.useML
@@ -284,13 +357,10 @@ func (s *ScalperStrategy) findScalpOpportunity(w *polymarket.PredictionWindow) {
 	if s.engine != nil {
 		state := s.engine.GetWindowState(w.ID)
 		if state != nil && !state.StartPrice.IsZero() {
-			currentPrice := s.engine.GetCurrentPrice()
-			if !currentPrice.IsZero() {
-				priceMove := currentPrice.Sub(state.StartPrice).Abs()
+			cp := s.engine.GetCurrentPrice()
+			if !cp.IsZero() {
+				priceMove := cp.Sub(state.StartPrice).Abs()
 				priceMovePct = priceMove.Div(state.StartPrice)
-				
-				// Record price for volatility tracking
-				s.dynamicThreshold.GetCollector(asset).RecordPrice(currentPrice)
 			}
 		}
 	}
@@ -610,6 +680,103 @@ func (s *ScalperStrategy) executeEntry(w *polymarket.PredictionWindow, features 
 		Str("P(profit)", features.ProfitProbability.StringFixed(2)).
 		Bool("ml_mode", true).
 		Msg("🧠 [ML] INTELLIGENT ENTRY")
+
+	// Place the order
+	s.placeOrder(pos, w, "BUY")
+}
+
+// executeSmartEntry executes a trade based on the probability model's decision
+func (s *ScalperStrategy) executeSmartEntry(w *polymarket.PredictionWindow, decision *TradeDecision) {
+	asset := w.Asset
+	side := decision.Side
+	marketPrice := decision.MarketPrice
+	
+	var tokenID string
+	if side == "UP" {
+		tokenID = w.YesTokenID
+	} else {
+		tokenID = w.NoTokenID
+	}
+
+	// Calculate position size based on model's recommendation
+	tickSize := decimal.NewFromFloat(0.01)
+	roundedPrice := marketPrice.Div(tickSize).Floor().Mul(tickSize)
+	if roundedPrice.LessThan(tickSize) {
+		roundedPrice = tickSize
+	}
+
+	// Use Kelly-based size from model, scaled to our position size
+	kellyFraction := decision.RecommendedSize.InexactFloat64()
+	posValue := s.positionSize.Mul(decimal.NewFromFloat(kellyFraction))
+	if posValue.LessThan(decimal.NewFromFloat(0.50)) {
+		posValue = decimal.NewFromFloat(0.50) // Minimum $0.50
+	}
+
+	size := posValue.Div(roundedPrice).Floor().IntPart()
+	if size < 5 {
+		size = 5 // Minimum 5 shares
+	}
+
+	// Calculate dynamic stop loss based on edge
+	// Tighter stops for trades with high confidence
+	stopPct := decimal.NewFromFloat(0.75) // Default 25% loss
+	if decision.Confidence > 0.7 {
+		stopPct = decimal.NewFromFloat(0.80) // 20% loss for high confidence
+	}
+	stopPrice := roundedPrice.Mul(stopPct)
+	if stopPrice.LessThan(decimal.NewFromFloat(0.02)) {
+		stopPrice = decimal.NewFromFloat(0.02)
+	}
+
+	// Target = fair price (model's estimate of true value)
+	targetPrice := decision.FairPrice
+	if targetPrice.LessThanOrEqual(roundedPrice) {
+		// If fair is below market (shouldn't happen), use 50% profit target
+		targetPrice = roundedPrice.Mul(decimal.NewFromFloat(1.5))
+	}
+
+	// Get current asset price for logging
+	priceAtEntry := decimal.Zero
+	if s.engine != nil {
+		priceAtEntry = s.engine.GetCurrentPrice()
+	}
+
+	pos := &ScalpPosition{
+		TradeID:          uuid.New().String(),
+		Asset:            asset,
+		Side:             side,
+		EntryPrice:       roundedPrice,
+		Size:             size,
+		EntryTime:        time.Now(),
+		TargetPrice:      targetPrice,
+		StopLoss:         stopPrice,
+		ConditionID:      w.ConditionID,
+		TokenID:          tokenID,
+		WindowID:         w.ID,
+		WindowTitle:      w.Question,
+		MLProbability:    decimal.NewFromFloat(decision.WinProb),
+		MLEntryThreshold: roundedPrice,
+		PriceAtEntry:     priceAtEntry,
+	}
+
+	actualCost := roundedPrice.Mul(decimal.NewFromInt(size))
+	potentialProfit := targetPrice.Sub(roundedPrice).Mul(decimal.NewFromInt(size))
+
+	log.Info().
+		Str("asset", asset).
+		Str("side", side).
+		Str("entry", roundedPrice.String()).
+		Str("fair", decision.FairPrice.String()).
+		Str("target", targetPrice.String()).
+		Str("stop_loss", stopPrice.String()).
+		Int64("size", size).
+		Str("cost", actualCost.String()).
+		Str("potential", potentialProfit.String()).
+		Float64("win_prob", decision.WinProb).
+		Str("edge", decision.Edge.Mul(decimal.NewFromInt(100)).StringFixed(0)+"¢").
+		Str("ev", decision.ExpectedValue.Mul(decimal.NewFromInt(100)).StringFixed(1)+"%").
+		Str("risk", decision.RiskLevel).
+		Msg("🧠 [SMART] PROBABILITY-BASED ENTRY!")
 
 	// Place the order
 	s.placeOrder(pos, w, "BUY")
