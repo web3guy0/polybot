@@ -547,7 +547,8 @@ func (c *CLOBClient) submitSignedOrderWithType(signedOrder *SignedCTFOrder, orde
 	return &orderResp, nil
 }
 
-// PlaceLimitOrder places a limit order at a specific price (GTC - stays on book)
+// PlaceLimitOrder places a limit order with aggressive pricing for fast fills
+// Uses FOK (Fill Or Kill) - order must fill immediately or is cancelled
 // Returns the order ID for tracking
 func (c *CLOBClient) PlaceLimitOrder(tokenID string, price, size decimal.Decimal, side string) (string, error) {
 	sideInt := SideBuy
@@ -556,13 +557,24 @@ func (c *CLOBClient) PlaceLimitOrder(tokenID string, price, size decimal.Decimal
 	}
 
 	// Round price to valid tick size (0.01 for all prices on Polymarket)
-	// For BUY orders, round DOWN to not overpay
-	// For SELL orders, round UP to not undersell
 	tickSize := decimal.NewFromFloat(0.01)
+	
+	// Add slippage for faster fills:
+	// BUY: Pay slightly MORE to be at front of queue
+	// SELL: Accept slightly LESS to fill faster
+	slippage := decimal.NewFromFloat(0.02) // 2 cents slippage
+	
 	if sideInt == SideBuy {
+		// Round DOWN base price, then ADD slippage
 		price = price.Div(tickSize).Floor().Mul(tickSize)
+		price = price.Add(slippage) // Pay 2¢ more to fill faster
 	} else {
+		// Round UP base price, then SUBTRACT slippage  
 		price = price.Div(tickSize).Ceil().Mul(tickSize)
+		price = price.Sub(slippage) // Accept 2¢ less to fill faster
+		if price.LessThan(tickSize) {
+			price = tickSize // Minimum 1¢
+		}
 	}
 
 	// Ensure minimum size of 5 shares (Polymarket requirement)
@@ -587,8 +599,9 @@ func (c *CLOBClient) PlaceLimitOrder(tokenID string, price, size decimal.Decimal
 		Str("price", price.String()).
 		Msg("⚡ Order signed (native Go)")
 
-	// Submit as GTC (Good Till Cancelled) so it stays on book
-	resp, err := c.submitSignedOrderWithType(signedOrder, "GTC")
+	// Submit as FOK (Fill Or Kill) - must fill immediately or cancel
+	// This prevents unfilled orders sitting on book while bot thinks it has position
+	resp, err := c.submitSignedOrderWithType(signedOrder, "FOK")
 	if err != nil {
 		return "", err
 	}
@@ -603,7 +616,8 @@ func (c *CLOBClient) PlaceLimitOrder(tokenID string, price, size decimal.Decimal
 		Str("price", price.String()).
 		Str("size", size.String()).
 		Str("side", side).
-		Msg("📋 Limit order placed")
+		Str("type", "FOK").
+		Msg("📋 Order placed (Fill-Or-Kill)")
 
 	return resp.OrderID, nil
 }

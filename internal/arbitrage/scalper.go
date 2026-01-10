@@ -725,6 +725,26 @@ func (s *ScalperStrategy) placeOrder(pos *ScalpPosition, w *polymarket.Predictio
 	delete(s.orderCooldowns, pos.Asset)
 
 	if side == "BUY" {
+		// CRITICAL: Verify the order was actually filled!
+		// FOK orders either fill completely or are cancelled
+		// We need to confirm before tracking position
+		time.Sleep(500 * time.Millisecond) // Brief wait for order to process
+		
+		status, filledSize, _, err := s.clobClient.GetOrderStatus(orderID)
+		if err != nil {
+			log.Warn().Err(err).Str("order_id", orderID).Msg("⚠️ [SCALP] Could not verify order status")
+			// Assume filled if we got an order ID back (FOK would have failed otherwise)
+		} else if status != "matched" && status != "filled" {
+			log.Warn().
+				Str("order_id", orderID).
+				Str("status", status).
+				Str("filled", filledSize.String()).
+				Msg("❌ [SCALP] Order NOT filled - not tracking position!")
+			// Set cooldown since the trade opportunity passed
+			s.orderCooldowns[pos.Asset] = time.Now().Add(1 * time.Minute)
+			return
+		}
+		
 		pos.OrderID = orderID
 		s.positions[pos.Asset] = pos
 		
@@ -739,7 +759,8 @@ func (s *ScalperStrategy) placeOrder(pos *ScalpPosition, w *polymarket.Predictio
 		log.Info().
 			Str("order_id", orderID).
 			Str("asset", pos.Asset).
-			Msg("✅ [SCALP] BUY order placed!")
+			Str("status", "FILLED").
+			Msg("✅ [SCALP] BUY order FILLED - tracking position!")
 	} else {
 		// Calculate P&L
 		pnl := orderPrice.Sub(pos.EntryPrice).Mul(decimal.NewFromInt(pos.Size))
