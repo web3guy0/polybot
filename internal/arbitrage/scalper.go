@@ -30,7 +30,7 @@ import (
 
 // TradeNotifier interface for sending trade alerts
 type TradeNotifier interface {
-	SendTradeAlert(asset, side string, price decimal.Decimal, size int64, action string)
+	SendTradeAlert(asset, side string, price decimal.Decimal, size int64, action string, pnl decimal.Decimal)
 }
 
 type ScalperStrategy struct {
@@ -289,27 +289,39 @@ func (s *ScalperStrategy) findScalpOpportunity(w *polymarket.PredictionWindow) {
 	// SMART PROBABILITY MODEL - The brain of our trading!
 	// ═══════════════════════════════════════════════════════════════════════
 	
-	// Get price data
-	priceToBeat := w.PriceToBeat
+	// Get price data - CRITICAL: Must have accurate Price to Beat!
+	priceToBeat := decimal.Zero
 	currentPrice := decimal.Zero
 	momentum := 0.0
 	
+	// PRIORITY 1: Get from engine's tracked state (most reliable!)
 	if s.engine != nil {
 		currentPrice = s.engine.GetCurrentPrice()
 		
-		// Fall back to engine's tracked start price if no PriceToBeat
-		if priceToBeat.IsZero() {
-			if state := s.engine.GetWindowState(w.ID); state != nil {
-				priceToBeat = state.StartPrice
-			}
-		}
-		
-		// Record price for volatility tracking
-		if !currentPrice.IsZero() {
-			s.dynamicThreshold.GetCollector(asset).RecordPrice(currentPrice)
-			// TODO: Calculate momentum from price history
+		// Get start price from engine's window state
+		if state := s.engine.GetWindowState(w.ID); state != nil && !state.StartPrice.IsZero() {
+			priceToBeat = state.StartPrice
 		}
 	}
+	
+	// PRIORITY 2: Use window's PriceToBeat if engine doesn't have it
+	if priceToBeat.IsZero() && !w.PriceToBeat.IsZero() {
+		priceToBeat = w.PriceToBeat
+	}
+	
+	// Log if we're missing critical data
+	if priceToBeat.IsZero() {
+		log.Debug().Str("asset", asset).Msg("⚠️ [SCALP] No Price to Beat - waiting for next window")
+		return
+	}
+	
+	if currentPrice.IsZero() {
+		log.Debug().Str("asset", asset).Msg("⚠️ [SCALP] No current price - waiting for feed")
+		return
+	}
+	
+	// Record price for volatility tracking
+	s.dynamicThreshold.GetCollector(asset).RecordPrice(currentPrice)
 	
 	// Use the probability model to decide
 	if s.probModel != nil && !priceToBeat.IsZero() && !currentPrice.IsZero() {
@@ -1046,7 +1058,7 @@ func (s *ScalperStrategy) placeOrder(pos *ScalpPosition, w *polymarket.Predictio
 		
 		// Send Telegram alert
 		if s.notifier != nil {
-			s.notifier.SendTradeAlert(pos.Asset, pos.Side, orderPrice, pos.Size, "BUY")
+			s.notifier.SendTradeAlert(pos.Asset, pos.Side, orderPrice, pos.Size, "BUY", decimal.Zero)
 		}
 		
 		log.Info().
@@ -1122,7 +1134,7 @@ func (s *ScalperStrategy) placeOrder(pos *ScalpPosition, w *polymarket.Predictio
 		
 		// Send Telegram alert with P&L
 		if s.notifier != nil {
-			s.notifier.SendTradeAlert(pos.Asset, pos.Side, orderPrice, pos.Size, action)
+			s.notifier.SendTradeAlert(pos.Asset, pos.Side, orderPrice, pos.Size, action, pnl)
 		}
 		
 		delete(s.positions, pos.Asset)

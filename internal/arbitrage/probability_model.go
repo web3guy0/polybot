@@ -117,11 +117,11 @@ func NewProbabilityModel() *ProbabilityModel {
 		tradeHistory: make([]ProbTradeOutcome, 0),
 		params: ModelParams{
 			BaseReversalProb: 0.50,  // 50% at no move
-			MoveDecayRate:    150.0, // Tuned for BTC
-			TimeBoostFactor:  0.02,  // 2% per minute
-			MomentumFactor:   0.5,   // Momentum halves reversal chance
-			MinEdgeCents:     0.15,  // 15¢ minimum edge
-			MaxLossProb:      0.60,  // Max 60% loss probability
+			MoveDecayRate:    200.0, // FASTER decay - big moves = low reversal
+			TimeBoostFactor:  0.015, // Less time boost
+			MomentumFactor:   0.7,   // Momentum matters more
+			MinEdgeCents:     0.20,  // 20¢ minimum edge (STRICTER!)
+			MaxLossProb:      0.40,  // Max 40% loss = need >60% win!
 		},
 		volatility: make(map[string]*VolatilityTracker),
 	}
@@ -139,6 +139,20 @@ func (pm *ProbabilityModel) Analyze(
 ) TradeDecision {
 	pm.mu.RLock()
 	defer pm.mu.RUnlock()
+
+	// HARD CEILING: NEVER buy odds above 15¢ - learned this the hard way!
+	maxOdds := decimal.NewFromFloat(0.15)
+	upTooExpensive := upOdds.GreaterThan(maxOdds)
+	downTooExpensive := downOdds.GreaterThan(maxOdds)
+	
+	if upTooExpensive && downTooExpensive {
+		return TradeDecision{
+			ShouldTrade: false,
+			Reason:      fmt.Sprintf("Both sides too expensive: UP=%.0f¢ DOWN=%.0f¢ (max 15¢)", 
+				upOdds.Mul(decimal.NewFromInt(100)).InexactFloat64(),
+				downOdds.Mul(decimal.NewFromInt(100)).InexactFloat64()),
+		}
+	}
 
 	// Calculate price move
 	if priceToBeat.IsZero() || currentPrice.IsZero() {
@@ -180,8 +194,8 @@ func (pm *ProbabilityModel) Analyze(
 	// Find the best opportunity
 	var decision TradeDecision
 
-	// Check UP side
-	if edgeUp.GreaterThan(decimal.NewFromFloat(pm.params.MinEdgeCents)) {
+	// Check UP side (skip if too expensive)
+	if !upTooExpensive && edgeUp.GreaterThan(decimal.NewFromFloat(pm.params.MinEdgeCents)) {
 		winProb := fairUp
 		ev := pm.calculateExpectedValue(upOdds.InexactFloat64(), winProb)
 
@@ -199,8 +213,8 @@ func (pm *ProbabilityModel) Analyze(
 		}
 	}
 
-	// Check DOWN side (prefer higher edge)
-	if edgeDown.GreaterThan(decimal.NewFromFloat(pm.params.MinEdgeCents)) {
+	// Check DOWN side (prefer higher edge, skip if too expensive)
+	if !downTooExpensive && edgeDown.GreaterThan(decimal.NewFromFloat(pm.params.MinEdgeCents)) {
 		winProb := fairDown
 		ev := pm.calculateExpectedValue(downOdds.InexactFloat64(), winProb)
 

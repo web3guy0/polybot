@@ -79,12 +79,13 @@ func (b *Bot) Stop() {
 }
 
 // SendTradeAlert sends a trade notification
-func (b *Bot) SendTradeAlert(asset, side string, price decimal.Decimal, size int64, action string) {
+func (b *Bot) SendTradeAlert(asset, side string, price decimal.Decimal, size int64, action string, pnl decimal.Decimal) {
 	b.mu.RLock()
 	alertsOn := b.alertsOn
 	b.mu.RUnlock()
 
 	if !alertsOn || b.chatID == 0 {
+		log.Debug().Str("action", action).Bool("alertsOn", alertsOn).Int64("chatID", b.chatID).Msg("📱 Alert skipped")
 		return
 	}
 
@@ -93,21 +94,32 @@ func (b *Bot) SendTradeAlert(asset, side string, price decimal.Decimal, size int
 		emoji = "🔴"
 	}
 
+	// Base message
 	msg := fmt.Sprintf(`%s *%s %s*
 
 Asset: *%s*
 Side: *%s*
 Price: *%s¢*
-Size: *%d shares*
-Time: %s`,
+Size: *%d shares*`,
 		emoji, action, side,
 		asset,
 		side,
 		price.Mul(decimal.NewFromInt(100)).StringFixed(1),
 		size,
-		time.Now().Format("15:04:05"),
 	)
 
+	// Add P&L for sells
+	if action == "SELL" || action == "STOP" {
+		pnlIcon := "💰"
+		if pnl.LessThan(decimal.Zero) {
+			pnlIcon = "💸"
+		}
+		msg += fmt.Sprintf("\nP&L: *%s $%s*", pnlIcon, pnl.StringFixed(2))
+	}
+
+	msg += fmt.Sprintf("\nTime: %s", time.Now().Format("15:04:05"))
+
+	log.Info().Str("action", action).Str("asset", asset).Msg("📱 Sending Telegram alert")
 	b.sendMarkdown(msg)
 }
 
