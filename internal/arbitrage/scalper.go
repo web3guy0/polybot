@@ -154,9 +154,10 @@ func (s *ScalperStrategy) checkWindows() {
 
 	for i := range windows {
 		w := &windows[i]
+		asset := w.Asset
 		
 		s.mu.Lock()
-		pos, hasPos := s.positions[w.ID]
+		pos, hasPos := s.positions[asset]  // Use ASSET as key, not window ID!
 		s.mu.Unlock()
 
 		if hasPos {
@@ -450,16 +451,21 @@ func (s *ScalperStrategy) managePosition(pos *ScalpPosition, w *polymarket.Predi
 	holdTime := time.Since(pos.EntryTime)
 
 	// Check profit target - SELL!
-	if currentPrice.GreaterThanOrEqual(pos.TargetPrice) {
+	// Also sell if we've made 50%+ profit on entry (e.g., bought at 8¢, now 12¢+)
+	profitPct := currentPrice.Sub(pos.EntryPrice).Div(pos.EntryPrice)
+	minProfitPct := decimal.NewFromFloat(0.50) // Take profit at 50% gain
+	
+	if currentPrice.GreaterThanOrEqual(pos.TargetPrice) || profitPct.GreaterThanOrEqual(minProfitPct) {
 		profit := currentPrice.Sub(pos.EntryPrice).Mul(decimal.NewFromInt(pos.Size))
 		log.Info().
 			Str("asset", pos.Asset).
 			Str("side", pos.Side).
 			Str("entry", pos.EntryPrice.String()).
 			Str("current", currentPrice.String()).
+			Str("profit_pct", profitPct.Mul(decimal.NewFromInt(100)).StringFixed(1)+"%").
 			Str("profit", profit.String()).
 			Str("hold_time", holdTime.Round(time.Second).String()).
-			Msg("💰 [SCALP] PROFIT TARGET HIT!")
+			Msg("💰 [SCALP] PROFIT TARGET HIT - SELLING!")
 
 		s.placeOrder(pos, w, "SELL")
 		return

@@ -341,6 +341,9 @@ func (dt *DynamicThreshold) CalculateDynamicProfit(asset string, entryPrice deci
 	} else if minRemaining < 7 {
 		// Medium time - moderate target
 		target = entryPrice.Mul(decimal.NewFromFloat(1.5)) // 50% above entry
+	} else {
+		// Plenty of time - aim for 75% profit
+		target = entryPrice.Mul(decimal.NewFromFloat(1.75))
 	}
 
 	// High volatility = expect bigger swings
@@ -349,14 +352,24 @@ func (dt *DynamicThreshold) CalculateDynamicProfit(asset string, entryPrice deci
 		target = target.Mul(decimal.NewFromFloat(1.15))
 	}
 
-	// Cap between 25¢ and 50¢
-	minProfit := decimal.NewFromFloat(0.25)
-	maxProfit := decimal.NewFromFloat(0.50)
-	if target.LessThan(minProfit) {
-		target = minProfit
+	// Target should be percentage-based, not fixed!
+	// If entry is 8¢, target should be ~12-14¢ (50-75% profit), not 25¢!
+	// Cap between entry+30% and entry+100%
+	minTarget := entryPrice.Mul(decimal.NewFromFloat(1.30)) // At least 30% profit
+	maxTarget := entryPrice.Mul(decimal.NewFromFloat(2.00)) // At most 100% profit
+	
+	if target.LessThan(minTarget) {
+		target = minTarget
 	}
-	if target.GreaterThan(maxProfit) {
-		target = maxProfit
+	if target.GreaterThan(maxTarget) {
+		target = maxTarget
+	}
+	
+	// Also cap absolute value - never set target above 40¢ 
+	// (at 40¢+ market is uncertain, take what you can)
+	absoluteMax := decimal.NewFromFloat(0.40)
+	if target.GreaterThan(absoluteMax) {
+		target = absoluteMax
 	}
 
 	return target
