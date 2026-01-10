@@ -247,9 +247,11 @@ func main() {
 	}
 	
 	// Register engines and scalpers for each asset
+	// Also connect telegram as notifier for trade alerts
 	for i, asset := range assets {
 		telegramBot.AddEngine(asset, arbEngines[i])
 		telegramBot.AddScalper(asset, scalperStrategies[i])
+		scalperStrategies[i].SetNotifier(telegramBot) // Connect Telegram for alerts
 	}
 
 	go telegramBot.Start()

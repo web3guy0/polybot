@@ -25,11 +25,18 @@ import (
 // - Momentum detection
 // - Historical win rate learning
 // - Kelly criterion position sizing
+
+// TradeNotifier interface for sending trade alerts
+type TradeNotifier interface {
+	SendTradeAlert(asset, side string, price decimal.Decimal, size int64, action string)
+}
+
 type ScalperStrategy struct {
 	windowScanner *polymarket.WindowScanner
 	clobClient    *CLOBClient
 	engine        *Engine // Reference to engine for price-to-beat data
 	db            *database.Database // Database for trade logging
+	notifier      TradeNotifier // For Telegram alerts
 	
 	// ML-powered dynamic thresholds
 	dynamicThreshold *DynamicThreshold
@@ -52,6 +59,9 @@ type ScalperStrategy struct {
 
 	// Active positions we're scalping
 	positions map[string]*ScalpPosition
+	
+	// Cooldowns to prevent spam after failed orders
+	orderCooldowns map[string]time.Time // asset -> next allowed order time
 	
 	// Stats
 	totalTrades   int
@@ -111,6 +121,7 @@ func NewScalperStrategy(scanner *polymarket.WindowScanner, clobClient *CLOBClien
 		maxWindowAge:     DefaultMaxWindowAge,
 		maxPriceMovePct:  decimal.NewFromFloat(DefaultMaxPriceMovePct),
 		positions:        make(map[string]*ScalpPosition),
+		orderCooldowns:   make(map[string]time.Time),
 		totalProfit:      decimal.Zero,
 		stopCh:           make(chan struct{}),
 		// Initialize ML-powered dynamic thresholds
@@ -128,6 +139,12 @@ func (s *ScalperStrategy) SetEngine(engine *Engine) {
 func (s *ScalperStrategy) SetDatabase(db *database.Database) {
 	s.db = db
 	log.Info().Msg("📊 [SCALP] Database connected for trade logging")
+}
+
+// SetNotifier sets the notifier for trade alerts (Telegram)
+func (s *ScalperStrategy) SetNotifier(n TradeNotifier) {
+	s.notifier = n
+	log.Info().Msg("📱 [SCALP] Notifier connected for trade alerts")
 }
 
 // EnableML enables/disables ML-powered dynamic thresholds
@@ -178,7 +195,17 @@ func (s *ScalperStrategy) checkWindows() {
 		
 		s.mu.Lock()
 		pos, hasPos := s.positions[asset]  // Use ASSET as key, not window ID!
+		cooldownTime, onCooldown := s.orderCooldowns[asset]
 		s.mu.Unlock()
+
+		// Check if we're on cooldown (failed order recently)
+		if onCooldown && time.Now().Before(cooldownTime) {
+			log.Debug().
+				Str("asset", asset).
+				Str("cooldown_until", cooldownTime.Format("15:04:05")).
+				Msg("⏳ [SCALP] On cooldown - skipping")
+			continue
+		}
 
 		if hasPos {
 			// Manage existing position
@@ -651,12 +678,22 @@ func (s *ScalperStrategy) placeOrder(pos *ScalpPosition, w *polymarket.Predictio
 	if err != nil {
 		log.Error().Err(err).Str("asset", pos.Asset).Msg("❌ [SCALP] Failed to place order")
 		if side == "BUY" {
-			// Failed to enter - don't track position
+			// Failed to enter - SET COOLDOWN to prevent spam retries!
+			cooldownDuration := 2 * time.Minute // Wait 2 minutes before retrying this asset
+			s.orderCooldowns[pos.Asset] = time.Now().Add(cooldownDuration)
+			log.Warn().
+				Str("asset", pos.Asset).
+				Str("cooldown", cooldownDuration.String()).
+				Msg("⏳ [SCALP] Order failed - cooling down")
 			return
 		}
-		// Failed to exit - keep position for retry
+		// Failed to exit - keep position for retry (shorter cooldown)
+		s.orderCooldowns[pos.Asset] = time.Now().Add(30 * time.Second)
 		return
 	}
+	
+	// Clear any cooldown on success
+	delete(s.orderCooldowns, pos.Asset)
 
 	if side == "BUY" {
 		pos.OrderID = orderID
@@ -664,6 +701,11 @@ func (s *ScalperStrategy) placeOrder(pos *ScalpPosition, w *polymarket.Predictio
 		
 		// Save entry to database
 		s.saveEntryToDB(pos, orderID)
+		
+		// Send Telegram alert
+		if s.notifier != nil {
+			s.notifier.SendTradeAlert(pos.Asset, pos.Side, orderPrice, pos.Size, "BUY")
+		}
 		
 		log.Info().
 			Str("order_id", orderID).
@@ -687,6 +729,15 @@ func (s *ScalperStrategy) placeOrder(pos *ScalpPosition, w *polymarket.Predictio
 		
 		// Update database with exit
 		s.saveExitToDB(pos, orderID, orderPrice, pnl, exitType)
+		
+		// Send Telegram alert with P&L
+		if s.notifier != nil {
+			action := "SELL"
+			if exitType == "stop_loss" {
+				action = "STOP"
+			}
+			s.notifier.SendTradeAlert(pos.Asset, pos.Side, orderPrice, pos.Size, action)
+		}
 		
 		delete(s.positions, pos.Asset)
 		log.Info().
