@@ -58,18 +58,19 @@ type SniperConfig struct {
 
 // SniperPosition represents an active sniper position
 type SniperPosition struct {
-	TradeID     string
-	Asset       string
-	Side        string // "UP" or "DOWN"
-	TokenID     string
-	ConditionID string
-	WindowID    string
-	EntryPrice  decimal.Decimal
-	Size        int64 // Number of shares
-	EntryTime   time.Time
-	StopLoss    decimal.Decimal
-	Target      decimal.Decimal
-	WindowEnd   time.Time
+	TradeID      string
+	Asset        string
+	Side         string // "UP" or "DOWN"
+	TokenID      string
+	ConditionID  string
+	WindowID     string
+	EntryPrice   decimal.Decimal
+	Size         int64 // Number of shares
+	EntryTime    time.Time
+	StopLoss     decimal.Decimal
+	Target       decimal.Decimal
+	WindowEnd    time.Time
+	PriceMovePct decimal.Decimal // Price move % at entry (to decide hold vs flip)
 }
 
 // SniperStrategy implements the last-minute sniper trading strategy
@@ -385,11 +386,11 @@ func (s *SniperStrategy) evaluateWindow(w *polymarket.PredictionWindow) {
 	}
 
 	// Execute the snipe!
-	s.executeSnipe(w, winningSide, winningOdds, tokenID, timeRemaining)
+	s.executeSnipe(w, winningSide, winningOdds, tokenID, timeRemaining, priceMovePct)
 }
 
 // executeSnipe executes a sniper trade
-func (s *SniperStrategy) executeSnipe(w *polymarket.PredictionWindow, side string, odds decimal.Decimal, tokenID string, timeRemaining time.Duration) {
+func (s *SniperStrategy) executeSnipe(w *polymarket.PredictionWindow, side string, odds decimal.Decimal, tokenID string, timeRemaining time.Duration, priceMovePct decimal.Decimal) {
 	asset := w.Asset
 	if asset == "" {
 		asset = "BTC"
@@ -422,18 +423,19 @@ func (s *SniperStrategy) executeSnipe(w *polymarket.PredictionWindow, side strin
 
 	// Create position
 	pos := &SniperPosition{
-		TradeID:     fmt.Sprintf("snipe-%s-%d", asset, time.Now().UnixNano()),
-		Asset:       asset,
-		Side:        side,
-		TokenID:     tokenID,
-		ConditionID: w.ConditionID,
-		WindowID:    w.ID,
-		EntryPrice:  roundedPrice,
-		Size:        size,
-		EntryTime:   time.Now(),
-		StopLoss:    s.config.StopLoss,
-		Target:      s.config.QuickFlipTarget,
-		WindowEnd:   w.EndDate,
+		TradeID:      fmt.Sprintf("snipe-%s-%d", asset, time.Now().UnixNano()),
+		Asset:        asset,
+		Side:         side,
+		TokenID:      tokenID,
+		ConditionID:  w.ConditionID,
+		WindowID:     w.ID,
+		EntryPrice:   roundedPrice,
+		Size:         size,
+		EntryTime:    time.Now(),
+		StopLoss:     s.config.StopLoss,
+		Target:       s.config.QuickFlipTarget,
+		WindowEnd:    w.EndDate,
+		PriceMovePct: priceMovePct, // Track price move to decide hold vs flip
 	}
 
 	// Place the order
@@ -558,13 +560,29 @@ func (s *SniperStrategy) checkPosition(pos *SniperPosition) {
 	}
 
 	// Check for quick flip target (95¢+)
+	// BUT if price moved 0.1%+ at entry, HOLD to resolution for $1 payout
+	holdThreshold := decimal.NewFromFloat(0.001) // 0.1%
+	
 	if currentOdds.GreaterThanOrEqual(s.config.QuickFlipTarget) {
+		if pos.PriceMovePct.GreaterThanOrEqual(holdThreshold) {
+			// Strong move - hold to resolution for max profit!
+			log.Info().
+				Str("asset", pos.Asset).
+				Str("side", pos.Side).
+				Str("current", currentOdds.Mul(decimal.NewFromInt(100)).StringFixed(0)+"¢").
+				Str("price_move", pos.PriceMovePct.Mul(decimal.NewFromInt(100)).StringFixed(2)+"%").
+				Msg("🎯 [SNIPER] STRONG MOVE (0.1%+) - HOLDING TO RESOLUTION for $1!")
+			return // Don't quick flip, hold for resolution
+		}
+		
+		// Weak move - quick flip at 95¢
 		log.Info().
 			Str("asset", pos.Asset).
 			Str("side", pos.Side).
 			Str("current", currentOdds.Mul(decimal.NewFromInt(100)).StringFixed(0)+"¢").
 			Str("target", s.config.QuickFlipTarget.Mul(decimal.NewFromInt(100)).StringFixed(0)+"¢").
-			Msg("🎯 [SNIPER] TARGET HIT! Quick flipping...")
+			Str("price_move", pos.PriceMovePct.Mul(decimal.NewFromInt(100)).StringFixed(2)+"%").
+			Msg("🎯 [SNIPER] TARGET HIT! Quick flipping (move < 0.1%)...")
 		
 		s.exitPosition(pos, currentOdds, "TARGET")
 		return
