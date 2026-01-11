@@ -386,6 +386,16 @@ func (s *ScalperStrategy) findScalpOpportunity(w *polymarket.PredictionWindow) {
 		}
 	}
 	
+	// If probability model couldn't run (missing price data), DON'T TRADE
+	// The fallback ML path caused losses by betting against price direction
+	log.Debug().
+		Str("asset", asset).
+		Str("price_to_beat", priceToBeat.String()).
+		Str("current_price", currentPrice.String()).
+		Msg("⚠️ [SCALP] No trade - probability model requires price data")
+	return
+	
+	/* DISABLED LEGACY ML PATH - caused losses by betting against direction
 	// ═══════════════════════════════════════════════════════════════════════
 	// FALLBACK: Legacy ML analysis if probability model can't run
 	// ═══════════════════════════════════════════════════════════════════════
@@ -635,6 +645,7 @@ func (s *ScalperStrategy) findScalpOpportunity(w *polymarket.PredictionWindow) {
 
 	// Place the order
 	s.placeOrder(pos, w, "BUY")
+	END DISABLED LEGACY PATH */
 }
 
 // executeEntry executes an entry trade with ML-recommended parameters

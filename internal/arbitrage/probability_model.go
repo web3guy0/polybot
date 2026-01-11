@@ -117,11 +117,12 @@ func NewProbabilityModel() *ProbabilityModel {
 		tradeHistory: make([]ProbTradeOutcome, 0),
 		params: ModelParams{
 			BaseReversalProb: 0.50,  // 50% at no move
-			MoveDecayRate:    200.0, // FASTER decay - big moves = low reversal
-			TimeBoostFactor:  0.015, // Less time boost
-			MomentumFactor:   0.7,   // Momentum matters more
-			MinEdgeCents:     0.20,  // 20¢ minimum edge (STRICTER!)
-			MaxLossProb:      0.40,  // Max 40% loss = need >60% win!
+			MoveDecayRate:    3.0,   // FIXED: Was 200 (way too aggressive!)
+			                         // Now: 0.1% move → 37% reversal, 0.5% → 11%, 1% → 2.5%
+			TimeBoostFactor:  0.03,  // More time boost for small moves
+			MomentumFactor:   0.5,   // Momentum adjustment
+			MinEdgeCents:     0.25,  // 25¢ minimum edge (even stricter)
+			MaxLossProb:      0.35,  // Max 35% loss = need >65% win!
 		},
 		volatility: make(map[string]*VolatilityTracker),
 	}
@@ -168,6 +169,31 @@ func (pm *ProbabilityModel) Analyze(
 
 	// Determine which side is "winning" based on price move
 	priceWentUp := currentPrice.GreaterThan(priceToBeat)
+	absMovePct := math.Abs(movePct)
+
+	// ═══════════════════════════════════════════════════════════════════════════
+	// HARD BLOCK: If price moved significantly, NEVER bet against the move!
+	// This is the #1 cause of losses - betting DOWN when price went UP
+	// ═══════════════════════════════════════════════════════════════════════════
+	if absMovePct > 0.05 { // More than 0.05% move
+		// Only allow betting WITH the direction
+		if priceWentUp && downOdds.LessThan(decimal.NewFromFloat(0.15)) {
+			// Price went UP but DOWN is cheap - this is a TRAP!
+			return TradeDecision{
+				ShouldTrade: false,
+				Reason:      fmt.Sprintf("BLOCKED: Price UP %.3f%% - DOWN at %.0f¢ is a trap!", 
+					movePct, downOdds.Mul(decimal.NewFromInt(100)).InexactFloat64()),
+			}
+		}
+		if !priceWentUp && upOdds.LessThan(decimal.NewFromFloat(0.15)) {
+			// Price went DOWN but UP is cheap - this is a TRAP!
+			return TradeDecision{
+				ShouldTrade: false,
+				Reason:      fmt.Sprintf("BLOCKED: Price DOWN %.3f%% - UP at %.0f¢ is a trap!", 
+					movePct, upOdds.Mul(decimal.NewFromInt(100)).InexactFloat64()),
+			}
+		}
+	}
 
 	// Calculate reversal probability
 	reversalProb := pm.calculateReversalProbability(movePct, timeMin, momentum)
