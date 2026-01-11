@@ -306,6 +306,16 @@ func main() {
 				clobClient,
 				cfg.SniperPositionSize,
 			)
+			// Apply config from .env
+			sniper.SetConfig(
+				cfg.SniperMinTimeMin,
+				cfg.SniperMaxTimeMin,
+				cfg.SniperMinPriceMove,
+				cfg.SniperMinOdds,
+				cfg.SniperMaxOdds,
+				cfg.SniperTarget,
+				cfg.SniperStopLoss,
+			)
 			// Link sniper to engine for price data
 			sniper.SetEngine(arbEngines[i])
 			// Connect to database for trade logging

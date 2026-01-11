@@ -146,6 +146,33 @@ func (s *SniperStrategy) SetNotifier(n TradeNotifier) {
 	log.Info().Msg("📱 [SNIPER] Notifier connected")
 }
 
+// SetConfig updates the sniper configuration from external config
+func (s *SniperStrategy) SetConfig(
+	minTimeMin, maxTimeMin float64,
+	minPriceMove, minOdds, maxOdds, target, stopLoss decimal.Decimal,
+) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	
+	s.config.MinTimeRemainingMin = minTimeMin
+	s.config.MaxTimeRemainingMin = maxTimeMin
+	s.config.MinPriceMovePct = minPriceMove
+	s.config.MinOddsEntry = minOdds
+	s.config.MaxOddsEntry = maxOdds
+	s.config.QuickFlipTarget = target
+	s.config.StopLoss = stopLoss
+	
+	log.Info().
+		Float64("min_time_min", minTimeMin).
+		Float64("max_time_min", maxTimeMin).
+		Str("min_price_move", minPriceMove.Mul(decimal.NewFromInt(100)).StringFixed(1)+"%").
+		Str("min_odds", minOdds.StringFixed(2)).
+		Str("max_odds", maxOdds.StringFixed(2)).
+		Str("target", target.StringFixed(2)).
+		Str("stop", stopLoss.StringFixed(2)).
+		Msg("🎯 [SNIPER] Config updated from env")
+}
+
 // SetDashboard sets the dashboard
 func (s *SniperStrategy) SetDashboard(d *dashboard.ResponsiveDash) {
 	s.dash = d
