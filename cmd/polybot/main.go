@@ -40,43 +40,32 @@ const version = "5.0.0" // Mean Reversion Swing Trading
 func main() {
 	// Check for dashboard mode FIRST (before setting up zerolog)
 	useDashboard := false
-	useResponsive := false // New: Responsive professional dashboard
 	useSwing := false      // Mean reversion swing trading
 	for _, arg := range os.Args[1:] {
-		if arg == "--dashboard" || arg == "-d" {
+		if arg == "--dashboard" || arg == "-d" || arg == "--responsive" || arg == "-r" {
 			useDashboard = true
-		}
-		if arg == "--responsive" || arg == "-r" {
-			useResponsive = true
 		}
 		if arg == "--swing" || arg == "-s" {
 			useSwing = true
 		}
 	}
 
-	// Create professional dashboard (institutional grade)
-	var proDash *dashboard.ProDashboard
-	var respDash *dashboard.ResponsiveDash
+	// Create dashboard
+	var dash *dashboard.ResponsiveDash
 	
-	if useResponsive {
+	if useDashboard {
 		strategyName := "SCALPER"
 		if useSwing {
 			strategyName = "SWING"
 		}
-		respDash = dashboard.NewResponsiveDash(strategyName)
-	} else if useDashboard {
-		proDash = dashboard.NewProDashboard()
+		dash = dashboard.NewResponsiveDash(strategyName)
 	}
 
 	// Setup logging - route to dashboard if enabled
-	if useResponsive && respDash != nil {
-		// Silent mode - logs go to responsive dashboard
-		zerolog.SetGlobalLevel(zerolog.InfoLevel)
-		log.Logger = log.Output(respDash.Writer())
-	} else if useDashboard && proDash != nil {
+	if dash != nil {
 		// Silent mode - logs go to dashboard
 		zerolog.SetGlobalLevel(zerolog.InfoLevel)
-		log.Logger = log.Output(proDash.Writer())
+		log.Logger = log.Output(dash.Writer())
 	} else {
 		// Normal console logging
 		log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr})
@@ -264,8 +253,8 @@ func main() {
 			)
 			swing.SetEngine(arbEngines[i]) // For live price data
 			swing.SetNotifier(nil) // Will set after telegram init
-			if proDash != nil {
-				swing.SetDashboard(proDash)
+			if dash != nil {
+				swing.SetDashboard(dash)
 			}
 			swing.Start()
 			swingStrategies = append(swingStrategies, swing)
@@ -327,19 +316,15 @@ func main() {
 		if useSwing && i < len(swingStrategies) {
 			// Using swing strategy
 			swingStrategies[i].SetNotifier(telegramBot)
-			if respDash != nil {
-				swingStrategies[i].SetResponsiveDashboard(respDash)
-			} else if proDash != nil {
-				swingStrategies[i].SetDashboard(proDash)
+			if dash != nil {
+				swingStrategies[i].SetDashboard(dash)
 			}
 		} else if !useSwing && i < len(scalperStrategies) {
 			// Using scalper strategy
 			telegramBot.AddScalper(asset, scalperStrategies[i])
 			scalperStrategies[i].SetNotifier(telegramBot)
-			if respDash != nil {
-				scalperStrategies[i].SetResponsiveDashboard(respDash)
-			} else if proDash != nil {
-				scalperStrategies[i].SetProDashboard(proDash)
+			if dash != nil {
+				scalperStrategies[i].SetDashboard(dash)
 			}
 		}
 	}
@@ -347,10 +332,8 @@ func main() {
 	go telegramBot.Start()
 	
 	// Start dashboard if enabled
-	if respDash != nil {
-		respDash.Start()
-	} else if proDash != nil {
-		proDash.Start()
+	if dash != nil {
+		dash.Start()
 	}
 
 	// ====== STARTUP COMPLETE ======
@@ -402,9 +385,9 @@ func main() {
 	// Graceful shutdown
 	log.Info().Msg("Shutting down...")
 
-	// Stop professional dashboard first
-	if proDash != nil {
-		proDash.Stop()
+	// Stop dashboard first
+	if dash != nil {
+		dash.Stop()
 	}
 	
 	telegramBot.Stop()

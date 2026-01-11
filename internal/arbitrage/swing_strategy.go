@@ -38,8 +38,7 @@ type SwingStrategy struct {
 	engine        *Engine // For live price data
 	db            *database.Database
 	notifier      TradeNotifier
-	proDash       *dashboard.ProDashboard
-	respDash      *dashboard.ResponsiveDash
+	dash          *dashboard.ResponsiveDash
 
 	// State
 	positions   map[string]*SwingPosition // Asset -> position
@@ -123,16 +122,10 @@ func (s *SwingStrategy) SetEngine(e *Engine) {
 	log.Info().Msg("⚡ [SWING] Engine connected for price data")
 }
 
-// SetDashboard sets the dashboard updater (ProDashboard)
-func (s *SwingStrategy) SetDashboard(d *dashboard.ProDashboard) {
-	s.proDash = d
+// SetDashboard sets the terminal dashboard
+func (s *SwingStrategy) SetDashboard(d *dashboard.ResponsiveDash) {
+	s.dash = d
 	log.Info().Msg("📊 [SWING] Dashboard connected")
-}
-
-// SetResponsiveDashboard sets the responsive dashboard
-func (s *SwingStrategy) SetResponsiveDashboard(d *dashboard.ResponsiveDash) {
-	s.respDash = d
-	log.Info().Msg("📊 [SWING] Responsive dashboard connected")
 }
 
 // Start begins the swing trading loop
@@ -554,10 +547,8 @@ func (s *SwingStrategy) updateDashboard() {
 
 	// Update stats
 	s.mu.RLock()
-	if s.respDash != nil {
-		s.respDash.UpdateStats(s.totalTrades, s.winningTrades, s.totalProfit, cachedBalance)
-	} else if s.proDash != nil {
-		s.proDash.UpdateStats(s.totalTrades, s.winningTrades, s.totalProfit, cachedBalance)
+	if s.dash != nil {
+		s.dash.UpdateStats(s.totalTrades, s.winningTrades, s.totalProfit, cachedBalance)
 	}
 	s.mu.RUnlock()
 }
@@ -570,10 +561,8 @@ func (s *SwingStrategy) updateMarketData(asset string, priceToBeat, upOdds, down
 		livePrice = s.engine.GetCurrentPrice()
 	}
 	
-	if s.respDash != nil {
-		s.respDash.UpdateMarket(asset, livePrice, priceToBeat, upOdds, downOdds)
-	} else if s.proDash != nil {
-		s.proDash.UpdateMarket(asset, livePrice, priceToBeat, upOdds, downOdds)
+	if s.dash != nil {
+		s.dash.UpdateMarket(asset, livePrice, priceToBeat, upOdds, downOdds)
 	}
 }
 
