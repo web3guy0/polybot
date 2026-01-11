@@ -41,12 +41,16 @@ func main() {
 	// Check for dashboard mode FIRST (before setting up zerolog)
 	useDashboard := false
 	useSwing := false      // Mean reversion swing trading
+	useSniper := false     // Last minute sniper strategy
 	for _, arg := range os.Args[1:] {
 		if arg == "--dashboard" || arg == "-d" || arg == "--responsive" || arg == "-r" {
 			useDashboard = true
 		}
 		if arg == "--swing" || arg == "-s" {
 			useSwing = true
+		}
+		if arg == "--sniper" || arg == "--snipe" {
+			useSniper = true
 		}
 	}
 
@@ -57,6 +61,9 @@ func main() {
 		strategyName := "SCALPER"
 		if useSwing {
 			strategyName = "SWING"
+		}
+		if useSniper {
+			strategyName = "SNIPER"
 		}
 		dash = dashboard.NewResponsiveDash(strategyName)
 	}
@@ -266,7 +273,7 @@ func main() {
 	// Buy extreme mispricings (<20¢) and sell when they bounce to 33¢+
 	// CRITICAL: Uses engine's price-to-beat data to avoid late entries!
 	var scalperStrategies []*arbitrage.ScalperStrategy
-	if !useSwing {
+	if !useSwing && !useSniper {
 		scalperStrategies = make([]*arbitrage.ScalperStrategy, 0, len(assets))
 		for i, asset := range assets {
 			scalper := arbitrage.NewScalperStrategy(
@@ -284,6 +291,30 @@ func main() {
 			scalper.Start()
 			scalperStrategies = append(scalperStrategies, scalper)
 			log.Info().Str("asset", asset).Bool("paper", cfg.DryRun).Msg("🎯 Scalper strategy started")
+		}
+	}
+	
+	// ====== SNIPER STRATEGY ======
+	// Last-minute high-confidence trades: buy at 85-92¢ in final 2-3 mins
+	// Target: 95¢ (5-10¢ profit) | Stop: 75¢ (tight risk control)
+	var sniperStrategies []*arbitrage.SniperStrategy
+	if useSniper {
+		sniperStrategies = make([]*arbitrage.SniperStrategy, 0, len(assets))
+		for i, asset := range assets {
+			sniper := arbitrage.NewSniperStrategy(
+				windowScanners[i],
+				clobClient,
+				cfg.SniperPositionSize,
+			)
+			// Link sniper to engine for price data
+			sniper.SetEngine(arbEngines[i])
+			// Connect to database for trade logging
+			if db != nil {
+				sniper.SetDatabase(db)
+			}
+			sniper.Start()
+			sniperStrategies = append(sniperStrategies, sniper)
+			log.Info().Str("asset", asset).Bool("paper", cfg.DryRun).Msg("🎯 Sniper strategy started")
 		}
 	}
 	
@@ -319,8 +350,14 @@ func main() {
 			if dash != nil {
 				swingStrategies[i].SetDashboard(dash)
 			}
-		} else if !useSwing && i < len(scalperStrategies) {
-			// Using scalper strategy
+		} else if useSniper && i < len(sniperStrategies) {
+			// Using sniper strategy
+			sniperStrategies[i].SetNotifier(telegramBot)
+			if dash != nil {
+				sniperStrategies[i].SetDashboard(dash)
+			}
+		} else if !useSwing && !useSniper && i < len(scalperStrategies) {
+			// Using scalper strategy (default)
 			telegramBot.AddScalper(asset, scalperStrategies[i])
 			scalperStrategies[i].SetNotifier(telegramBot)
 			if dash != nil {
@@ -352,6 +389,20 @@ func main() {
 		log.Info().Msg("║                                          ║")
 		log.Info().Msg("║  📈 Entry: 8¢-65¢ range only            ║")
 		log.Info().Msg("║  🎯 Exit: Bounce target / Stop loss      ║")
+		log.Info().Msg("╚══════════════════════════════════════════╝")
+	} else if useSniper {
+		log.Info().Msg("╔══════════════════════════════════════════╗")
+		log.Info().Msg("║   🎯 LAST MINUTE SNIPER STRATEGY 🎯       ║")
+		log.Info().Msg("║                                          ║")
+		log.Info().Msg("║  Strategy: High-confidence final trades  ║")
+		log.Info().Msg("║                                          ║")
+		log.Info().Msgf("║  Assets: %-32s ║", formatAssets(assets))
+		log.Info().Msg("║  → Wait for last 1-3 minutes             ║")
+		log.Info().Msg("║  → Buy at 85-92¢ if price moved 0.2%+   ║")
+		log.Info().Msg("║  → Target 95¢ / Stop 75¢                ║")
+		log.Info().Msg("║                                          ║")
+		log.Info().Msg("║  🔫 Quick scalps on near-certain bets   ║")
+		log.Info().Msg("║  ⚡ 5-10¢ profit, tight risk control     ║")
 		log.Info().Msg("╚══════════════════════════════════════════╝")
 	} else {
 		log.Info().Msg("╔══════════════════════════════════════════╗")

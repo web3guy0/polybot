@@ -61,6 +61,16 @@ SignatureType    int    // 0=EOA, 1=Magic/Email, 2=Proxy
 	SwingMinDropPct     decimal.Decimal // Min drop % to trigger entry (e.g., 0.12 = 12¢)
 	SwingCooldownSec    int             // Cooldown between trades
 
+	// Sniper Strategy Settings (Last Minute)
+	SniperPositionSize  decimal.Decimal // USD per sniper trade
+	SniperMinTimeMin    float64         // Min time remaining (minutes)
+	SniperMaxTimeMin    float64         // Max time remaining (minutes)
+	SniperMinPriceMove  decimal.Decimal // Min price move to confirm direction
+	SniperMinOdds       decimal.Decimal // Min odds to buy (e.g., 0.85)
+	SniperMaxOdds       decimal.Decimal // Max odds to buy (e.g., 0.92)
+	SniperTarget        decimal.Decimal // Quick flip target (e.g., 0.95)
+	SniperStopLoss      decimal.Decimal // Stop loss (e.g., 0.75)
+
 	// Triple Exit Strategy
 	ArbExitOddsThreshold decimal.Decimal // e.g., 0.75 = exit at 75¢ for quick flip
 	ArbHoldThreshold     decimal.Decimal // e.g., 0.005 = 0.5% BTC move confirms direction
@@ -120,6 +130,16 @@ SignatureType:    getEnvInt("SIGNATURE_TYPE", 0),
 		SwingMinDropPct:     getEnvDecimal("SWING_MIN_DROP_PCT", decimal.NewFromFloat(0.12)),
 		SwingCooldownSec:    getEnvInt("SWING_COOLDOWN_SEC", 30),
 
+		// Sniper Strategy (Last Minute)
+		SniperPositionSize:  getEnvDecimal("SNIPER_POSITION_SIZE", decimal.NewFromFloat(3.50)),
+		SniperMinTimeMin:    getEnvFloat("SNIPER_MIN_TIME_MIN", 1.0),
+		SniperMaxTimeMin:    getEnvFloat("SNIPER_MAX_TIME_MIN", 3.0),
+		SniperMinPriceMove:  getEnvDecimal("SNIPER_MIN_PRICE_MOVE", decimal.NewFromFloat(0.002)),
+		SniperMinOdds:       getEnvDecimal("SNIPER_MIN_ODDS", decimal.NewFromFloat(0.85)),
+		SniperMaxOdds:       getEnvDecimal("SNIPER_MAX_ODDS", decimal.NewFromFloat(0.92)),
+		SniperTarget:        getEnvDecimal("SNIPER_TARGET", decimal.NewFromFloat(0.95)),
+		SniperStopLoss:      getEnvDecimal("SNIPER_STOP_LOSS", decimal.NewFromFloat(0.75)),
+
 		// Triple Exit Strategy
 		ArbExitOddsThreshold: getEnvDecimal("ARB_EXIT_ODDS", decimal.NewFromFloat(0.75)),       // Sell at 75¢+
 		ArbHoldThreshold:     getEnvDecimal("ARB_HOLD_THRESHOLD", decimal.NewFromFloat(0.005)), // 0.5% BTC confirms direction
@@ -167,6 +187,15 @@ func getEnvInt(key string, defaultValue int) int {
 if value := os.Getenv(key); value != "" {
 if i, err := strconv.Atoi(value); err == nil {
 return i
+}
+}
+return defaultValue
+}
+
+func getEnvFloat(key string, defaultValue float64) float64 {
+if value := os.Getenv(key); value != "" {
+if f, err := strconv.ParseFloat(value, 64); err == nil {
+return f
 }
 }
 return defaultValue
