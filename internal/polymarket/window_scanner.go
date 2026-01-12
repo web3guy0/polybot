@@ -58,6 +58,7 @@ type WindowScanner struct {
 	restURL      string
 	asset        string // The asset to scan for (BTC, ETH, etc.)
 	priceFetcher *CLOBPriceFetcher // For real-time CLOB prices
+	wsClient     *WSClient         // WebSocket for real-time odds (FAST!)
 
 	windows   []PredictionWindow
 	windowsMu sync.RWMutex
@@ -83,6 +84,11 @@ func NewWindowScanner(apiURL string, asset string) *WindowScanner {
 // SetNewWindowCallback sets callback for new windows
 func (s *WindowScanner) SetNewWindowCallback(cb func(PredictionWindow)) {
 	s.onNewWindow = cb
+}
+
+// SetWSClient sets the WebSocket client for real-time odds
+func (s *WindowScanner) SetWSClient(ws *WSClient) {
+	s.wsClient = ws
 }
 
 // Start begins scanning for prediction windows
@@ -123,18 +129,28 @@ func (s *WindowScanner) scan() {
 		return
 	}
 
-	// CRITICAL: Fetch LIVE prices from CLOB for each window!
+	// CRITICAL: Fetch LIVE prices from WebSocket first (FASTEST!), fallback to CLOB REST
 	for i := range windows {
 		if windows[i].YesTokenID != "" && windows[i].NoTokenID != "" {
+			// Try WebSocket first (instant, no network latency!)
+			if s.wsClient != nil && s.wsClient.IsConnected() {
+				upPrice, downPrice, ok := s.wsClient.GetMarketPrices(windows[i].YesTokenID, windows[i].NoTokenID)
+				if ok && !upPrice.IsZero() {
+					windows[i].YesPrice = upPrice
+					windows[i].NoPrice = downPrice
+					// Subscribe if not already (for future updates)
+					s.wsClient.Subscribe(windows[i].ConditionID, windows[i].YesTokenID, windows[i].NoTokenID)
+					continue // Got WS price, skip REST
+				}
+				// No WS price yet - subscribe for next time
+				s.wsClient.Subscribe(windows[i].ConditionID, windows[i].YesTokenID, windows[i].NoTokenID)
+			}
+			
+			// Fallback to REST (slower, only if WS didn't have price)
 			upPrice, downPrice, err := s.priceFetcher.GetLivePrices(windows[i].YesTokenID, windows[i].NoTokenID)
 			if err == nil && !upPrice.IsZero() {
 				windows[i].YesPrice = upPrice
 				windows[i].NoPrice = downPrice
-				log.Debug().
-					Str("asset", windows[i].Asset).
-					Str("up_live", upPrice.String()).
-					Str("down_live", downPrice.String()).
-					Msg("📡 LIVE prices from CLOB")
 			}
 		}
 	}
@@ -352,7 +368,7 @@ func (s *WindowScanner) matchesAsset(questionLower string) bool {
 	}
 }
 
-// GetActiveWindows returns currently active prediction windows
+// GetActiveWindows returns currently active prediction windows with REAL-TIME WebSocket prices
 func (s *WindowScanner) GetActiveWindows() []PredictionWindow {
 	s.windowsMu.RLock()
 	defer s.windowsMu.RUnlock()
@@ -363,6 +379,13 @@ func (s *WindowScanner) GetActiveWindows() []PredictionWindow {
 	for _, w := range s.windows {
 		// Only include windows that haven't ended
 		if w.Active && !w.Closed && (w.EndDate.IsZero() || w.EndDate.After(now)) {
+			// Get REAL-TIME prices from WebSocket (instant, no network latency!)
+			if s.wsClient != nil && s.wsClient.IsConnected() && w.YesTokenID != "" {
+				if upPrice, downPrice, ok := s.wsClient.GetMarketPrices(w.YesTokenID, w.NoTokenID); ok {
+					w.YesPrice = upPrice
+					w.NoPrice = downPrice
+				}
+			}
 			active = append(active, w)
 		}
 	}

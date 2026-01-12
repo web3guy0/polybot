@@ -210,6 +210,10 @@ func main() {
 	for _, asset := range assets {
 		// Window scanner for this asset
 		scanner := polymarket.NewWindowScanner(cfg.PolymarketAPIURL, asset)
+		// Connect WebSocket for REAL-TIME odds (ms latency!)
+		if wsClient != nil {
+			scanner.SetWSClient(wsClient)
+		}
 		scanner.Start()
 		windowScanners = append(windowScanners, scanner)
 		log.Info().Str("asset", asset).Msg("🔍 Window scanner started")
