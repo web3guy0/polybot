@@ -62,14 +62,29 @@ SignatureType    int    // 0=EOA, 1=Magic/Email, 2=Proxy
 	SwingCooldownSec    int             // Cooldown between trades
 
 	// Sniper Strategy Settings (Last Minute)
-	SniperPositionSize  decimal.Decimal // USD per sniper trade
-	SniperMinTimeMin    float64         // Min time remaining (minutes)
-	SniperMaxTimeMin    float64         // Max time remaining (minutes)
-	SniperMinPriceMove  decimal.Decimal // Min price move to confirm direction
-	SniperMinOdds       decimal.Decimal // Min odds to buy (e.g., 0.85)
-	SniperMaxOdds       decimal.Decimal // Max odds to buy (e.g., 0.92)
-	SniperTarget        decimal.Decimal // Quick flip target (e.g., 0.95)
-	SniperStopLoss      decimal.Decimal // Stop loss (e.g., 0.75)
+	SniperPositionSize    decimal.Decimal // USD per sniper trade
+	SniperMinTimeMin      float64         // Min time remaining (minutes)
+	SniperMaxTimeMin      float64         // Max time remaining (minutes)
+	SniperMinPriceMove    decimal.Decimal // Min price move to confirm direction
+	SniperMinOdds         decimal.Decimal // Min odds to buy (e.g., 0.79)
+	SniperMaxOdds         decimal.Decimal // Max odds to buy (e.g., 0.90)
+	
+	// Per-Asset Sniper Config (override global defaults)
+	SniperBTCMinOdds     decimal.Decimal // BTC: min entry (stable)
+	SniperBTCMaxOdds     decimal.Decimal // BTC: max entry
+	SniperBTCStopLoss    decimal.Decimal // BTC: stop loss
+	SniperBTCMinPriceMove decimal.Decimal // BTC: 0.05% price move
+	SniperETHMinOdds     decimal.Decimal // ETH: min entry
+	SniperETHMaxOdds     decimal.Decimal // ETH: max entry
+	SniperETHStopLoss    decimal.Decimal // ETH: stop loss
+	SniperETHMinPriceMove decimal.Decimal // ETH: 0.05% price move
+	SniperSOLMinOdds     decimal.Decimal // SOL: min entry (volatile)
+	SniperSOLMaxOdds     decimal.Decimal // SOL: max entry
+	SniperSOLStopLoss    decimal.Decimal // SOL: stop loss
+	SniperSOLMinPriceMove decimal.Decimal // SOL: 0.10% price move (needs more)
+	SniperTarget          decimal.Decimal // Quick flip target (e.g., 0.95)
+	SniperStopLoss        decimal.Decimal // Stop loss (e.g., 0.75)
+	SniperHoldToResolution bool           // Hold to resolution instead of quick flip (default: false)
 
 	// Triple Exit Strategy
 	ArbExitOddsThreshold decimal.Decimal // e.g., 0.75 = exit at 75¢ for quick flip
@@ -130,15 +145,34 @@ SignatureType:    getEnvInt("SIGNATURE_TYPE", 0),
 		SwingMinDropPct:     getEnvDecimal("SWING_MIN_DROP_PCT", decimal.NewFromFloat(0.12)),
 		SwingCooldownSec:    getEnvInt("SWING_COOLDOWN_SEC", 30),
 
-		// Sniper Strategy (Last Minute)
-		SniperPositionSize:  getEnvDecimal("SNIPER_POSITION_SIZE", decimal.NewFromFloat(3.50)),
-		SniperMinTimeMin:    getEnvFloat("SNIPER_MIN_TIME_MIN", 1.0),
-		SniperMaxTimeMin:    getEnvFloat("SNIPER_MAX_TIME_MIN", 3.0),
-		SniperMinPriceMove:  getEnvDecimal("SNIPER_MIN_PRICE_MOVE", decimal.NewFromFloat(0.002)),
-		SniperMinOdds:       getEnvDecimal("SNIPER_MIN_ODDS", decimal.NewFromFloat(0.85)),
-		SniperMaxOdds:       getEnvDecimal("SNIPER_MAX_ODDS", decimal.NewFromFloat(0.92)),
-		SniperTarget:        getEnvDecimal("SNIPER_TARGET", decimal.NewFromFloat(0.95)),
-		SniperStopLoss:      getEnvDecimal("SNIPER_STOP_LOSS", decimal.NewFromFloat(0.75)),
+		// Sniper Strategy (Last Minute) - NEW OPTIMIZED DEFAULTS
+		SniperPositionSize:    getEnvDecimal("SNIPER_POSITION_SIZE", decimal.NewFromFloat(3.50)),
+		SniperMinTimeMin:      getEnvFloat("SNIPER_MIN_TIME_MIN", 1.0),
+		SniperMaxTimeMin:      getEnvFloat("SNIPER_MAX_TIME_MIN", 3.0),
+		SniperMinPriceMove:    getEnvDecimal("SNIPER_MIN_PRICE_MOVE", decimal.NewFromFloat(0.002)),
+		SniperMinOdds:         getEnvDecimal("SNIPER_MIN_ODDS", decimal.NewFromFloat(0.79)),  // Entry at 79¢+
+		SniperMaxOdds:         getEnvDecimal("SNIPER_MAX_ODDS", decimal.NewFromFloat(0.90)),  // Entry up to 90¢
+		SniperTarget:          getEnvDecimal("SNIPER_TARGET", decimal.NewFromFloat(0.99)),   // Exit at 99¢ (near resolution)
+		SniperStopLoss:        getEnvDecimal("SNIPER_STOP_LOSS", decimal.NewFromFloat(0.50)), // SL at 50¢ (wide, let it breathe)
+		SniperHoldToResolution: getEnvBool("SNIPER_HOLD_TO_RESOLUTION", false), // Default: quick flip at 99¢
+		
+		// Per-Asset Sniper Config - BTC (most stable, 0.05% move)
+		SniperBTCMinOdds:      getEnvDecimal("SNIPER_BTC_MIN_ODDS", decimal.NewFromFloat(0.82)),
+		SniperBTCMaxOdds:      getEnvDecimal("SNIPER_BTC_MAX_ODDS", decimal.NewFromFloat(0.88)),
+		SniperBTCStopLoss:     getEnvDecimal("SNIPER_BTC_STOP_LOSS", decimal.NewFromFloat(0.55)),
+		SniperBTCMinPriceMove: getEnvDecimal("SNIPER_BTC_MIN_PRICE_MOVE", decimal.NewFromFloat(0.05)), // 0.05%
+		
+		// Per-Asset Sniper Config - ETH (medium volatility, 0.05% move)
+		SniperETHMinOdds:      getEnvDecimal("SNIPER_ETH_MIN_ODDS", decimal.NewFromFloat(0.80)),
+		SniperETHMaxOdds:      getEnvDecimal("SNIPER_ETH_MAX_ODDS", decimal.NewFromFloat(0.88)),
+		SniperETHStopLoss:     getEnvDecimal("SNIPER_ETH_STOP_LOSS", decimal.NewFromFloat(0.52)),
+		SniperETHMinPriceMove: getEnvDecimal("SNIPER_ETH_MIN_PRICE_MOVE", decimal.NewFromFloat(0.05)), // 0.05%
+		
+		// Per-Asset Sniper Config - SOL (volatile, needs 0.10%+ move)
+		SniperSOLMinOdds:      getEnvDecimal("SNIPER_SOL_MIN_ODDS", decimal.NewFromFloat(0.79)),
+		SniperSOLMaxOdds:      getEnvDecimal("SNIPER_SOL_MAX_ODDS", decimal.NewFromFloat(0.90)),
+		SniperSOLStopLoss:     getEnvDecimal("SNIPER_SOL_STOP_LOSS", decimal.NewFromFloat(0.45)),
+		SniperSOLMinPriceMove: getEnvDecimal("SNIPER_SOL_MIN_PRICE_MOVE", decimal.NewFromFloat(0.10)), // 0.10%
 
 		// Triple Exit Strategy
 		ArbExitOddsThreshold: getEnvDecimal("ARB_EXIT_ODDS", decimal.NewFromFloat(0.75)),       // Sell at 75¢+

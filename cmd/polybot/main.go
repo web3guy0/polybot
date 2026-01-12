@@ -319,6 +319,13 @@ func main() {
 				cfg.SniperMaxOdds,
 				cfg.SniperTarget,
 				cfg.SniperStopLoss,
+				cfg.SniperHoldToResolution,
+			)
+			// Apply per-asset config (BTC/ETH/SOL: odds, SL, price move)
+			sniper.SetPerAssetConfig(
+				cfg.SniperBTCMinOdds, cfg.SniperBTCMaxOdds, cfg.SniperBTCStopLoss, cfg.SniperBTCMinPriceMove,
+				cfg.SniperETHMinOdds, cfg.SniperETHMaxOdds, cfg.SniperETHStopLoss, cfg.SniperETHMinPriceMove,
+				cfg.SniperSOLMinOdds, cfg.SniperSOLMaxOdds, cfg.SniperSOLStopLoss, cfg.SniperSOLMinPriceMove,
 			)
 			// Link sniper to engine for price data
 			sniper.SetEngine(arbEngines[i])

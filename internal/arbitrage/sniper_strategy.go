@@ -41,12 +41,13 @@ type SniperConfig struct {
 	MinTimeRemainingMin float64         // Minimum time left (e.g., 1 min)
 	MaxTimeRemainingMin float64         // Maximum time left (e.g., 3 min)
 	MinPriceMovePct     decimal.Decimal // Min price move % (e.g., 0.05 = 0.05%)
-	MinOddsEntry        decimal.Decimal // Min odds to buy (e.g., 0.85)
-	MaxOddsEntry        decimal.Decimal // Max odds to buy (e.g., 0.92)
+	MinOddsEntry        decimal.Decimal // Min odds to buy (e.g., 0.79)
+	MaxOddsEntry        decimal.Decimal // Max odds to buy (e.g., 0.90)
 
 	// Exit conditions
-	QuickFlipTarget decimal.Decimal // Sell at this price (e.g., 0.95)
-	StopLoss        decimal.Decimal // Cut loss at this price (e.g., 0.75)
+	QuickFlipTarget    decimal.Decimal // Sell at this price (e.g., 0.99)
+	StopLoss           decimal.Decimal // Cut loss at this price (e.g., 0.50)
+	HoldToResolution   bool            // Hold to resolution instead of quick flip
 
 	// Position sizing
 	PositionSizeUSD decimal.Decimal // USD per trade
@@ -54,6 +55,61 @@ type SniperConfig struct {
 	// Safety
 	MaxTradesPerWindow int           // Max 1 trade per window
 	CooldownDuration   time.Duration // Cooldown after trade
+	
+	// Per-Asset Overrides (if set, override global defaults)
+	AssetMinOdds     map[string]decimal.Decimal // Asset -> MinOdds
+	AssetMaxOdds     map[string]decimal.Decimal // Asset -> MaxOdds
+	AssetStopLoss    map[string]decimal.Decimal // Asset -> StopLoss
+	AssetMinPriceMove map[string]decimal.Decimal // Asset -> MinPriceMove (BTC/ETH: 0.05%, SOL: 0.10%)
+}
+
+// GetAssetConfig returns entry/exit params for specific asset (per-asset or global fallback)
+func (c *SniperConfig) GetAssetConfig(asset string) (minOdds, maxOdds, stopLoss, minPriceMove decimal.Decimal) {
+	// MinOdds
+	if c.AssetMinOdds != nil {
+		if v, ok := c.AssetMinOdds[asset]; ok {
+			minOdds = v
+		} else {
+			minOdds = c.MinOddsEntry
+		}
+	} else {
+		minOdds = c.MinOddsEntry
+	}
+	
+	// MaxOdds
+	if c.AssetMaxOdds != nil {
+		if v, ok := c.AssetMaxOdds[asset]; ok {
+			maxOdds = v
+		} else {
+			maxOdds = c.MaxOddsEntry
+		}
+	} else {
+		maxOdds = c.MaxOddsEntry
+	}
+	
+	// StopLoss
+	if c.AssetStopLoss != nil {
+		if v, ok := c.AssetStopLoss[asset]; ok {
+			stopLoss = v
+		} else {
+			stopLoss = c.StopLoss
+		}
+	} else {
+		stopLoss = c.StopLoss
+	}
+	
+	// MinPriceMove (BTC/ETH: 0.05%, SOL: 0.10%)
+	if c.AssetMinPriceMove != nil {
+		if v, ok := c.AssetMinPriceMove[asset]; ok {
+			minPriceMove = v
+		} else {
+			minPriceMove = c.MinPriceMovePct
+		}
+	} else {
+		minPriceMove = c.MinPriceMovePct
+	}
+	
+	return
 }
 
 // SniperPosition represents an active sniper position
@@ -118,11 +174,11 @@ func NewSniperStrategy(
 		config: SniperConfig{
 			MinTimeRemainingMin: 1.0,                             // At least 1 min left
 			MaxTimeRemainingMin: 3.0,                             // Max 3 min left (last 3 minutes)
-			MinPriceMovePct:     decimal.NewFromFloat(0.05),       // 0.05% price move minimum
-			MinOddsEntry:        decimal.NewFromFloat(0.85),      // Buy at 85¢ minimum
-			MaxOddsEntry:        decimal.NewFromFloat(0.92),      // Buy at 92¢ maximum
-			QuickFlipTarget:     decimal.NewFromFloat(0.95),      // Sell at 95¢
-			StopLoss:            decimal.NewFromFloat(0.75),      // Stop at 75¢
+			MinPriceMovePct:     decimal.NewFromFloat(0.05),      // 0.05% price move minimum
+			MinOddsEntry:        decimal.NewFromFloat(0.79),      // Buy at 79¢ minimum (new default)
+			MaxOddsEntry:        decimal.NewFromFloat(0.90),      // Buy at 90¢ maximum (new default)
+			QuickFlipTarget:     decimal.NewFromFloat(0.99),      // Sell at 99¢ (near resolution)
+			StopLoss:            decimal.NewFromFloat(0.50),      // Stop at 50¢ (wide SL)
 			PositionSizeUSD:     positionSize,                    // From config
 			MaxTradesPerWindow:  1,                               // Only 1 trade per window
 			CooldownDuration:    30 * time.Second,                // 30s cooldown
@@ -151,6 +207,7 @@ func (s *SniperStrategy) SetNotifier(n TradeNotifier) {
 func (s *SniperStrategy) SetConfig(
 	minTimeMin, maxTimeMin float64,
 	minPriceMove, minOdds, maxOdds, target, stopLoss decimal.Decimal,
+	holdToResolution bool,
 ) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -162,6 +219,7 @@ func (s *SniperStrategy) SetConfig(
 	s.config.MaxOddsEntry = maxOdds
 	s.config.QuickFlipTarget = target
 	s.config.StopLoss = stopLoss
+	s.config.HoldToResolution = holdToResolution
 	
 	log.Info().
 		Float64("min_time_min", minTimeMin).
@@ -171,7 +229,60 @@ func (s *SniperStrategy) SetConfig(
 		Str("max_odds", maxOdds.StringFixed(2)).
 		Str("target", target.StringFixed(2)).
 		Str("stop", stopLoss.StringFixed(2)).
+		Bool("hold_to_resolution", holdToResolution).
 		Msg("🎯 [SNIPER] Config updated from env")
+}
+
+// SetPerAssetConfig sets per-asset configuration overrides (odds, SL, price move)
+func (s *SniperStrategy) SetPerAssetConfig(
+	btcMinOdds, btcMaxOdds, btcStopLoss, btcMinPriceMove decimal.Decimal,
+	ethMinOdds, ethMaxOdds, ethStopLoss, ethMinPriceMove decimal.Decimal,
+	solMinOdds, solMaxOdds, solStopLoss, solMinPriceMove decimal.Decimal,
+) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	
+	// Initialize maps
+	s.config.AssetMinOdds = make(map[string]decimal.Decimal)
+	s.config.AssetMaxOdds = make(map[string]decimal.Decimal)
+	s.config.AssetStopLoss = make(map[string]decimal.Decimal)
+	s.config.AssetMinPriceMove = make(map[string]decimal.Decimal)
+	
+	// Set BTC config (stable, 0.05% move)
+	s.config.AssetMinOdds["BTC"] = btcMinOdds
+	s.config.AssetMaxOdds["BTC"] = btcMaxOdds
+	s.config.AssetStopLoss["BTC"] = btcStopLoss
+	s.config.AssetMinPriceMove["BTC"] = btcMinPriceMove.Div(decimal.NewFromInt(100)) // Convert 0.05 -> 0.0005
+	
+	// Set ETH config (medium, 0.05% move)
+	s.config.AssetMinOdds["ETH"] = ethMinOdds
+	s.config.AssetMaxOdds["ETH"] = ethMaxOdds
+	s.config.AssetStopLoss["ETH"] = ethStopLoss
+	s.config.AssetMinPriceMove["ETH"] = ethMinPriceMove.Div(decimal.NewFromInt(100))
+	
+	// Set SOL config (volatile, needs 0.10%+ move)
+	s.config.AssetMinOdds["SOL"] = solMinOdds
+	s.config.AssetMaxOdds["SOL"] = solMaxOdds
+	s.config.AssetStopLoss["SOL"] = solStopLoss
+	s.config.AssetMinPriceMove["SOL"] = solMinPriceMove.Div(decimal.NewFromInt(100))
+	
+	log.Info().
+		Str("btc", fmt.Sprintf("%.0f-%.0f¢, SL:%.0f¢, move:%.2f%%", 
+			btcMinOdds.Mul(decimal.NewFromInt(100)).InexactFloat64(), 
+			btcMaxOdds.Mul(decimal.NewFromInt(100)).InexactFloat64(), 
+			btcStopLoss.Mul(decimal.NewFromInt(100)).InexactFloat64(),
+			btcMinPriceMove.InexactFloat64())).
+		Str("eth", fmt.Sprintf("%.0f-%.0f¢, SL:%.0f¢, move:%.2f%%", 
+			ethMinOdds.Mul(decimal.NewFromInt(100)).InexactFloat64(), 
+			ethMaxOdds.Mul(decimal.NewFromInt(100)).InexactFloat64(), 
+			ethStopLoss.Mul(decimal.NewFromInt(100)).InexactFloat64(),
+			ethMinPriceMove.InexactFloat64())).
+		Str("sol", fmt.Sprintf("%.0f-%.0f¢, SL:%.0f¢, move:%.2f%%", 
+			solMinOdds.Mul(decimal.NewFromInt(100)).InexactFloat64(), 
+			solMaxOdds.Mul(decimal.NewFromInt(100)).InexactFloat64(), 
+			solStopLoss.Mul(decimal.NewFromInt(100)).InexactFloat64(),
+			solMinPriceMove.InexactFloat64())).
+		Msg("🎯 [SNIPER] Per-asset config loaded")
 }
 
 // SetDashboard sets the dashboard
@@ -314,12 +425,15 @@ func (s *SniperStrategy) evaluateWindow(w *polymarket.PredictionWindow) {
 	priceMove := currentPrice.Sub(priceToBeat)
 	priceMovePct := priceMove.Div(priceToBeat).Abs()
 
-	// Check if price moved enough
-	if priceMovePct.LessThan(s.config.MinPriceMovePct) {
+	// Get per-asset min price move (BTC/ETH: 0.05%, SOL: 0.10%)
+	_, _, _, minPriceMove := s.config.GetAssetConfig(asset)
+	
+	// Check if price moved enough (per-asset threshold)
+	if priceMovePct.LessThan(minPriceMove) {
 		log.Debug().
 			Str("asset", asset).
 			Str("move", priceMovePct.Mul(decimal.NewFromInt(100)).StringFixed(3)+"%").
-			Str("need", s.config.MinPriceMovePct.Mul(decimal.NewFromInt(100)).StringFixed(2)+"%").
+			Str("need", minPriceMove.Mul(decimal.NewFromInt(100)).StringFixed(2)+"%").
 			Msg("🎯 [SNIPER] Price move too small")
 		return
 	}
@@ -354,23 +468,25 @@ func (s *SniperStrategy) evaluateWindow(w *polymarket.PredictionWindow) {
 		tokenID = w.NoTokenID
 	}
 
-	// Check if odds are in our sniper range (85-92¢)
-	if winningOdds.LessThan(s.config.MinOddsEntry) {
+	// Check if odds are in our sniper range (per-asset or global)
+	minOdds, maxOdds, assetStopLoss, _ := s.config.GetAssetConfig(asset)
+	
+	if winningOdds.LessThan(minOdds) {
 		log.Debug().
 			Str("asset", asset).
 			Str("side", winningSide).
 			Str("odds", winningOdds.Mul(decimal.NewFromInt(100)).StringFixed(0)+"¢").
-			Str("min", s.config.MinOddsEntry.Mul(decimal.NewFromInt(100)).StringFixed(0)+"¢").
-			Msg("🎯 [SNIPER] Odds too low - waiting for 85¢+")
+			Str("min", minOdds.Mul(decimal.NewFromInt(100)).StringFixed(0)+"¢").
+			Msg("🎯 [SNIPER] Odds too low - waiting for entry")
 		return
 	}
 
-	if winningOdds.GreaterThan(s.config.MaxOddsEntry) {
+	if winningOdds.GreaterThan(maxOdds) {
 		log.Debug().
 			Str("asset", asset).
 			Str("side", winningSide).
 			Str("odds", winningOdds.Mul(decimal.NewFromInt(100)).StringFixed(0)+"¢").
-			Str("max", s.config.MaxOddsEntry.Mul(decimal.NewFromInt(100)).StringFixed(0)+"¢").
+			Str("max", maxOdds.Mul(decimal.NewFromInt(100)).StringFixed(0)+"¢").
 			Msg("🎯 [SNIPER] Odds too high - not worth the risk")
 		return
 	}
@@ -380,6 +496,8 @@ func (s *SniperStrategy) evaluateWindow(w *polymarket.PredictionWindow) {
 		Str("asset", asset).
 		Str("side", winningSide).
 		Str("odds", winningOdds.Mul(decimal.NewFromInt(100)).StringFixed(0)+"¢").
+		Str("range", fmt.Sprintf("%.0f¢-%.0f¢", minOdds.Mul(decimal.NewFromInt(100)).InexactFloat64(), maxOdds.Mul(decimal.NewFromInt(100)).InexactFloat64())).
+		Str("sl", assetStopLoss.Mul(decimal.NewFromInt(100)).StringFixed(0)+"¢").
 		Str("price_move", priceMovePct.Mul(decimal.NewFromInt(100)).StringFixed(3)+"%").
 		Float64("time_remaining_min", timeRemainingMin).
 		Bool("price_went_up", priceWentUp).
@@ -403,6 +521,9 @@ func (s *SniperStrategy) executeSnipe(w *polymarket.PredictionWindow, side strin
 		asset = "BTC"
 	}
 
+	// Get per-asset stop loss
+	_, _, assetStopLoss, _ := s.config.GetAssetConfig(asset)
+
 	// Calculate position size
 	tickSize := decimal.NewFromFloat(0.01)
 	roundedPrice := odds.Div(tickSize).Floor().Mul(tickSize)
@@ -414,21 +535,21 @@ func (s *SniperStrategy) executeSnipe(w *polymarket.PredictionWindow, side strin
 
 	actualCost := roundedPrice.Mul(decimal.NewFromInt(size))
 	potentialProfit := s.config.QuickFlipTarget.Sub(roundedPrice).Mul(decimal.NewFromInt(size))
-	maxLoss := roundedPrice.Sub(s.config.StopLoss).Mul(decimal.NewFromInt(size))
+	maxLoss := roundedPrice.Sub(assetStopLoss).Mul(decimal.NewFromInt(size))
 
 	log.Info().
 		Str("asset", asset).
 		Str("side", side).
 		Str("entry", roundedPrice.Mul(decimal.NewFromInt(100)).StringFixed(0)+"¢").
 		Str("target", s.config.QuickFlipTarget.Mul(decimal.NewFromInt(100)).StringFixed(0)+"¢").
-		Str("stop", s.config.StopLoss.Mul(decimal.NewFromInt(100)).StringFixed(0)+"¢").
+		Str("stop", assetStopLoss.Mul(decimal.NewFromInt(100)).StringFixed(0)+"¢").
 		Int64("shares", size).
 		Str("cost", "$"+actualCost.StringFixed(2)).
 		Str("potential_profit", "+$"+potentialProfit.StringFixed(2)).
 		Str("max_loss", "-$"+maxLoss.StringFixed(2)).
 		Msg("🎯 [SNIPER] EXECUTING SNIPE!")
 
-	// Create position
+	// Create position with per-asset stop loss
 	pos := &SniperPosition{
 		TradeID:      fmt.Sprintf("snipe-%s-%d", asset, time.Now().UnixNano()),
 		Asset:        asset,
@@ -439,7 +560,7 @@ func (s *SniperStrategy) executeSnipe(w *polymarket.PredictionWindow, side strin
 		EntryPrice:   roundedPrice,
 		Size:         size,
 		EntryTime:    time.Now(),
-		StopLoss:     s.config.StopLoss,
+		StopLoss:     assetStopLoss, // Use per-asset stop loss
 		Target:       s.config.QuickFlipTarget,
 		WindowEnd:    w.EndDate,
 		PriceMovePct: priceMovePct, // Track price move to decide hold vs flip
@@ -567,29 +688,29 @@ func (s *SniperStrategy) checkPosition(pos *SniperPosition) {
 	}
 
 	// Check for quick flip target (95¢+)
-	// BUT if price moved 0.1%+ at entry, HOLD to resolution for $1 payout
-	holdThreshold := decimal.NewFromFloat(0.001) // 0.1%
-	
+	// Only hold to resolution if explicitly enabled via SNIPER_HOLD_TO_RESOLUTION=true
 	if currentOdds.GreaterThanOrEqual(s.config.QuickFlipTarget) {
-		if pos.PriceMovePct.GreaterThanOrEqual(holdThreshold) {
-			// Strong move - hold to resolution for max profit!
-			log.Info().
-				Str("asset", pos.Asset).
-				Str("side", pos.Side).
-				Str("current", currentOdds.Mul(decimal.NewFromInt(100)).StringFixed(0)+"¢").
-				Str("price_move", pos.PriceMovePct.Mul(decimal.NewFromInt(100)).StringFixed(2)+"%").
-				Msg("🎯 [SNIPER] STRONG MOVE (0.1%+) - HOLDING TO RESOLUTION for $1!")
-			return // Don't quick flip, hold for resolution
+		if s.config.HoldToResolution {
+			// Hold to resolution enabled - check if price move is strong enough
+			holdThreshold := decimal.NewFromFloat(0.001) // 0.1%
+			if pos.PriceMovePct.GreaterThanOrEqual(holdThreshold) {
+				log.Info().
+					Str("asset", pos.Asset).
+					Str("side", pos.Side).
+					Str("current", currentOdds.Mul(decimal.NewFromInt(100)).StringFixed(0)+"¢").
+					Str("price_move", pos.PriceMovePct.Mul(decimal.NewFromInt(100)).StringFixed(2)+"%").
+					Msg("🎯 [SNIPER] STRONG MOVE (0.1%+) - HOLDING TO RESOLUTION for $1!")
+				return // Don't quick flip, hold for resolution
+			}
 		}
 		
-		// Weak move - quick flip at 95¢
+		// Quick flip at target (default behavior)
 		log.Info().
 			Str("asset", pos.Asset).
 			Str("side", pos.Side).
 			Str("current", currentOdds.Mul(decimal.NewFromInt(100)).StringFixed(0)+"¢").
 			Str("target", s.config.QuickFlipTarget.Mul(decimal.NewFromInt(100)).StringFixed(0)+"¢").
-			Str("price_move", pos.PriceMovePct.Mul(decimal.NewFromInt(100)).StringFixed(2)+"%").
-			Msg("🎯 [SNIPER] TARGET HIT! Quick flipping (move < 0.1%)...")
+			Msg("🎯 [SNIPER] TARGET HIT! Quick flipping...")
 		
 		s.exitPosition(pos, currentOdds, "TARGET")
 		return
@@ -623,13 +744,24 @@ func (s *SniperStrategy) checkPosition(pos *SniperPosition) {
 		return
 	}
 
-	// Check if window is about to end (last 30 seconds) - hold to resolution
+	// Check if window is about to end (last 30 seconds)
 	if time.Until(pos.WindowEnd) < 30*time.Second {
-		log.Info().
-			Str("asset", pos.Asset).
-			Str("side", pos.Side).
-			Str("time_left", time.Until(pos.WindowEnd).String()).
-			Msg("🎯 [SNIPER] Holding to resolution - too late to exit")
+		if s.config.HoldToResolution {
+			// Hold to resolution enabled - wait for $1 payout
+			log.Info().
+				Str("asset", pos.Asset).
+				Str("side", pos.Side).
+				Str("time_left", time.Until(pos.WindowEnd).String()).
+				Msg("🎯 [SNIPER] Holding to resolution - too late to exit")
+		} else {
+			// Quick flip mode - try to exit even in last 30 seconds
+			log.Info().
+				Str("asset", pos.Asset).
+				Str("side", pos.Side).
+				Str("current", currentOdds.Mul(decimal.NewFromInt(100)).StringFixed(0)+"¢").
+				Msg("🎯 [SNIPER] Last 30s - attempting final exit...")
+			s.exitPosition(pos, currentOdds, "FINAL_EXIT")
+		}
 	}
 }
 

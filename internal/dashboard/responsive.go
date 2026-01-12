@@ -269,7 +269,7 @@ func (d *ResponsiveDash) renderLoop() {
 	// Initial render
 	d.render()
 
-	ticker := time.NewTicker(100 * time.Millisecond)
+	ticker := time.NewTicker(300 * time.Millisecond) // Smooth 3 FPS render
 	defer ticker.Stop()
 
 	for {
