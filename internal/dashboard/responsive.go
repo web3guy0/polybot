@@ -98,12 +98,13 @@ type ResponsiveDash struct {
 	mlSignals map[string]*RMLSignal // ML analysis by asset
 	logs      []string
 
-	// Stats
-	totalTrades   int
-	winningTrades int
-	totalPnL      decimal.Decimal
-	balance       decimal.Decimal
-	dayPnL        decimal.Decimal
+	// Stats (cached to prevent flickering)
+	totalTrades      int
+	winningTrades    int
+	totalPnL         decimal.Decimal
+	balance          decimal.Decimal
+	dayPnL           decimal.Decimal
+	lastStatsUpdate  time.Time // Throttle stats updates to every 30s
 
 	// Strategy info
 	strategyName string
@@ -1119,15 +1120,27 @@ func (d *ResponsiveDash) AddLog(msg string) {
 	d.triggerUpdate()
 }
 
-// UpdateStats updates overall statistics
+// UpdateStats updates overall statistics (throttled to every 30s to prevent flickering)
 func (d *ResponsiveDash) UpdateStats(totalTrades, winningTrades int, totalPnL, balance decimal.Decimal) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+
+	// Throttle stats updates to every 30 seconds to prevent flickering
+	// Exception: always update if values changed significantly or first update
+	now := time.Now()
+	if !d.lastStatsUpdate.IsZero() && now.Sub(d.lastStatsUpdate) < 30*time.Second {
+		// Only update if there's a significant change (new trade or balance change > $0.10)
+		if totalTrades == d.totalTrades && 
+		   balance.Sub(d.balance).Abs().LessThan(decimal.NewFromFloat(0.10)) {
+			return // Skip update, too soon and no significant change
+		}
+	}
 
 	d.totalTrades = totalTrades
 	d.winningTrades = winningTrades
 	d.totalPnL = totalPnL
 	d.balance = balance
+	d.lastStatsUpdate = now
 
 	d.triggerUpdate()
 }
@@ -1140,11 +1153,17 @@ func (d *ResponsiveDash) SetMode(mode string) {
 	d.triggerUpdate()
 }
 
-// SetDayPnL sets today's P&L
+// SetDayPnL sets today's P&L (only triggers update on significant change)
 func (d *ResponsiveDash) SetDayPnL(pnl decimal.Decimal) {
 	d.mu.Lock()
+	defer d.mu.Unlock()
+	
+	// Only update if changed by at least $0.01 to prevent flickering
+	if pnl.Sub(d.dayPnL).Abs().LessThan(decimal.NewFromFloat(0.01)) {
+		return
+	}
+	
 	d.dayPnL = pnl
-	d.mu.Unlock()
 	d.triggerUpdate()
 }
 
