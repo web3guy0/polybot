@@ -357,14 +357,14 @@ func (d *ResponsiveDash) renderWide(buf *strings.Builder) {
 	col2W := d.width / 3
 	col3W := d.width - col1W - col2W
 
-	// Top panels get ~60% height, bottom log gets ~40%
-	topH := (d.height - 6) * 60 / 100
+	// Top panels get 45% height, activity log gets 55% (more space for logs)
+	topH := (d.height - 6) * 45 / 100
 	if topH < 8 {
 		topH = 8
 	}
 	bottomH := d.height - 6 - topH
-	if bottomH < 5 {
-		bottomH = 5
+	if bottomH < 8 {
+		bottomH = 8
 	}
 
 	d.drawHeader(buf, d.width)
@@ -387,14 +387,14 @@ func (d *ResponsiveDash) renderUltra(buf *strings.Builder) {
 	col2W := d.width / 3
 	col3W := d.width - col1W - col2W
 
-	// Top panels get ~55% height, bottom log gets ~45%
-	topH := (d.height - 6) * 55 / 100
+	// Top panels get 45% height, activity log gets 55% (more space for logs)
+	topH := (d.height - 6) * 45 / 100
 	if topH < 8 {
 		topH = 8
 	}
 	bottomH := d.height - 6 - topH
-	if bottomH < 6 {
-		bottomH = 6
+	if bottomH < 8 {
+		bottomH = 8
 	}
 
 	d.drawHeader(buf, d.width)
@@ -615,10 +615,10 @@ func (d *ResponsiveDash) renderMarketContent(buf *strings.Builder, width, height
 		}
 
 		if width >= 35 {
-			buf.WriteString(fmt.Sprintf("%-5s ║ $%-10.2f ║ $%-10.2f ║ %s%3.0f¢%s ║ %s%3.0f¢%s\n",
+			buf.WriteString(fmt.Sprintf("%-5s ║ %s$%10.2f%s ║ %s$%10.2f%s ║ %s%4.0f¢%s ║ %s%4.0f¢%s\n",
 				asset,
-				priceToBeat,
-				livePrice,
+				cDim, priceToBeat, cReset,
+				cSecondary, livePrice, cReset,
 				upColor, upOdds, cReset,
 				downColor, downOdds, cReset,
 			))
