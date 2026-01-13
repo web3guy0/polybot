@@ -56,49 +56,21 @@ type SniperConfig struct {
 	MaxTradesPerWindow int           // Max 1 trade per window
 	CooldownDuration   time.Duration // Cooldown after trade
 	
-	// Per-Asset Overrides (if set, override global defaults)
-	AssetMinOdds     map[string]decimal.Decimal // Asset -> MinOdds
-	AssetMaxOdds     map[string]decimal.Decimal // Asset -> MaxOdds
-	AssetStopLoss    map[string]decimal.Decimal // Asset -> StopLoss
-	AssetMinPriceMove map[string]decimal.Decimal // Asset -> MinPriceMove (BTC/ETH: 0.05%, SOL: 0.10%)
+	// Per-Asset Price Movement (CRITICAL - varies by volatility)
+	// BTC = 0.02% (stable), ETH = 0.04% (medium), SOL = 0.08% (volatile)
+	AssetMinPriceMove map[string]decimal.Decimal
 }
 
-// GetAssetConfig returns entry/exit params for specific asset (per-asset or global fallback)
+// GetAssetConfig returns config for specific asset
+// Entry odds and stop loss are GLOBAL, only price movement varies per-asset
 func (c *SniperConfig) GetAssetConfig(asset string) (minOdds, maxOdds, stopLoss, minPriceMove decimal.Decimal) {
-	// MinOdds
-	if c.AssetMinOdds != nil {
-		if v, ok := c.AssetMinOdds[asset]; ok {
-			minOdds = v
-		} else {
-			minOdds = c.MinOddsEntry
-		}
-	} else {
-		minOdds = c.MinOddsEntry
-	}
+	// Global settings
+	minOdds = c.MinOddsEntry
+	maxOdds = c.MaxOddsEntry
+	stopLoss = c.StopLoss
 	
-	// MaxOdds
-	if c.AssetMaxOdds != nil {
-		if v, ok := c.AssetMaxOdds[asset]; ok {
-			maxOdds = v
-		} else {
-			maxOdds = c.MaxOddsEntry
-		}
-	} else {
-		maxOdds = c.MaxOddsEntry
-	}
-	
-	// StopLoss
-	if c.AssetStopLoss != nil {
-		if v, ok := c.AssetStopLoss[asset]; ok {
-			stopLoss = v
-		} else {
-			stopLoss = c.StopLoss
-		}
-	} else {
-		stopLoss = c.StopLoss
-	}
-	
-	// MinPriceMove (BTC/ETH: 0.05%, SOL: 0.10%)
+	// Per-asset price movement (CRITICAL - based on volatility)
+	// BTC = 0.02% (stable), ETH = 0.04% (medium), SOL = 0.08% (volatile)
 	if c.AssetMinPriceMove != nil {
 		if v, ok := c.AssetMinPriceMove[asset]; ok {
 			minPriceMove = v
@@ -131,6 +103,14 @@ type SniperPosition struct {
 	TrailingStop decimal.Decimal // Dynamic trailing stop level
 }
 
+// MomentumTracker tracks price velocity for fast detection
+type MomentumTracker struct {
+	LastPrice     decimal.Decimal
+	LastTime      time.Time
+	Velocity      decimal.Decimal // Price change per second
+	Accelerating  bool            // Is price accelerating in one direction
+}
+
 // SniperStrategy implements the last-minute sniper trading strategy
 type SniperStrategy struct {
 	mu sync.RWMutex
@@ -153,6 +133,9 @@ type SniperStrategy struct {
 	running          bool
 	stopCh           chan struct{}
 
+	// Momentum tracking for fast detection
+	momentum map[string]*MomentumTracker // asset -> momentum
+
 	// Stats
 	totalTrades   int
 	winningTrades int
@@ -171,6 +154,7 @@ func NewSniperStrategy(
 		clobClient:       clobClient,
 		positions:        make(map[string]*SniperPosition),
 		windowTradeCount: make(map[string]int),
+		momentum:         make(map[string]*MomentumTracker), // Fast momentum detection
 		totalProfit:      decimal.Zero,
 		stopCh:           make(chan struct{}),
 		config: SniperConfig{
@@ -235,56 +219,29 @@ func (s *SniperStrategy) SetConfig(
 		Msg("🎯 [SNIPER] Config updated from env")
 }
 
-// SetPerAssetConfig sets per-asset configuration overrides (odds, SL, price move)
-func (s *SniperStrategy) SetPerAssetConfig(
-	btcMinOdds, btcMaxOdds, btcStopLoss, btcMinPriceMove decimal.Decimal,
-	ethMinOdds, ethMaxOdds, ethStopLoss, ethMinPriceMove decimal.Decimal,
-	solMinOdds, solMaxOdds, solStopLoss, solMinPriceMove decimal.Decimal,
+// SetPerAssetPriceMove sets per-asset price movement thresholds (CRITICAL for volatility)
+// BTC = 0.02% (stable, small moves are significant)
+// ETH = 0.04% (medium volatility)
+// SOL = 0.08% (volatile, needs bigger move to filter noise)
+func (s *SniperStrategy) SetPerAssetPriceMove(
+	btcMinPriceMove, ethMinPriceMove, solMinPriceMove decimal.Decimal,
 ) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	
-	// Initialize maps
-	s.config.AssetMinOdds = make(map[string]decimal.Decimal)
-	s.config.AssetMaxOdds = make(map[string]decimal.Decimal)
-	s.config.AssetStopLoss = make(map[string]decimal.Decimal)
+	// Initialize price move map
 	s.config.AssetMinPriceMove = make(map[string]decimal.Decimal)
 	
-	// Set BTC config (stable, 0.05% move)
-	s.config.AssetMinOdds["BTC"] = btcMinOdds
-	s.config.AssetMaxOdds["BTC"] = btcMaxOdds
-	s.config.AssetStopLoss["BTC"] = btcStopLoss
-	s.config.AssetMinPriceMove["BTC"] = btcMinPriceMove.Div(decimal.NewFromInt(100)) // Convert 0.05 -> 0.0005
-	
-	// Set ETH config (medium, 0.05% move)
-	s.config.AssetMinOdds["ETH"] = ethMinOdds
-	s.config.AssetMaxOdds["ETH"] = ethMaxOdds
-	s.config.AssetStopLoss["ETH"] = ethStopLoss
+	// Convert from env format (0.02) to decimal (0.0002)
+	s.config.AssetMinPriceMove["BTC"] = btcMinPriceMove.Div(decimal.NewFromInt(100))
 	s.config.AssetMinPriceMove["ETH"] = ethMinPriceMove.Div(decimal.NewFromInt(100))
-	
-	// Set SOL config (volatile, needs 0.10%+ move)
-	s.config.AssetMinOdds["SOL"] = solMinOdds
-	s.config.AssetMaxOdds["SOL"] = solMaxOdds
-	s.config.AssetStopLoss["SOL"] = solStopLoss
 	s.config.AssetMinPriceMove["SOL"] = solMinPriceMove.Div(decimal.NewFromInt(100))
 	
 	log.Info().
-		Str("btc", fmt.Sprintf("%.0f-%.0f¢, SL:%.0f¢, move:%.2f%%", 
-			btcMinOdds.Mul(decimal.NewFromInt(100)).InexactFloat64(), 
-			btcMaxOdds.Mul(decimal.NewFromInt(100)).InexactFloat64(), 
-			btcStopLoss.Mul(decimal.NewFromInt(100)).InexactFloat64(),
-			btcMinPriceMove.InexactFloat64())).
-		Str("eth", fmt.Sprintf("%.0f-%.0f¢, SL:%.0f¢, move:%.2f%%", 
-			ethMinOdds.Mul(decimal.NewFromInt(100)).InexactFloat64(), 
-			ethMaxOdds.Mul(decimal.NewFromInt(100)).InexactFloat64(), 
-			ethStopLoss.Mul(decimal.NewFromInt(100)).InexactFloat64(),
-			ethMinPriceMove.InexactFloat64())).
-		Str("sol", fmt.Sprintf("%.0f-%.0f¢, SL:%.0f¢, move:%.2f%%", 
-			solMinOdds.Mul(decimal.NewFromInt(100)).InexactFloat64(), 
-			solMaxOdds.Mul(decimal.NewFromInt(100)).InexactFloat64(), 
-			solStopLoss.Mul(decimal.NewFromInt(100)).InexactFloat64(),
-			solMinPriceMove.InexactFloat64())).
-		Msg("🎯 [SNIPER] Per-asset config loaded")
+		Str("btc", fmt.Sprintf("%.2f%%", btcMinPriceMove.InexactFloat64())).
+		Str("eth", fmt.Sprintf("%.2f%%", ethMinPriceMove.InexactFloat64())).
+		Str("sol", fmt.Sprintf("%.2f%%", solMinPriceMove.InexactFloat64())).
+		Msg("🎯 [SNIPER] Per-asset price thresholds (volatility-based)")
 }
 
 // SetDashboard sets the dashboard
@@ -357,6 +314,49 @@ func (s *SniperStrategy) scanForOpportunities() {
 	s.dashUpdateStats()
 }
 
+// updateMomentum updates momentum tracking for an asset and returns velocity info
+// Returns: velocity (price change per second), isAccelerating, isReady
+func (s *SniperStrategy) updateMomentum(asset string, currentPrice decimal.Decimal) (velocity decimal.Decimal, accelerating bool, ready bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := time.Now()
+
+	tracker, exists := s.momentum[asset]
+	if !exists || time.Since(tracker.LastTime) > 30*time.Second {
+		// New tracker or stale data - initialize
+		s.momentum[asset] = &MomentumTracker{
+			LastPrice: currentPrice,
+			LastTime:  now,
+			Velocity:  decimal.Zero,
+		}
+		return decimal.Zero, false, false
+	}
+
+	// Calculate velocity (price change per second)
+	elapsed := now.Sub(tracker.LastTime).Seconds()
+	if elapsed < 0.1 {
+		// Too soon, use cached values
+		return tracker.Velocity, tracker.Accelerating, true
+	}
+
+	priceChange := currentPrice.Sub(tracker.LastPrice)
+	newVelocity := priceChange.Div(decimal.NewFromFloat(elapsed))
+
+	// Check if accelerating (velocity magnitude increasing)
+	oldVelAbs := tracker.Velocity.Abs()
+	newVelAbs := newVelocity.Abs()
+	isAccelerating := newVelAbs.GreaterThan(oldVelAbs)
+
+	// Update tracker
+	tracker.LastPrice = currentPrice
+	tracker.LastTime = now
+	tracker.Velocity = newVelocity
+	tracker.Accelerating = isAccelerating
+
+	return newVelocity, isAccelerating, true
+}
+
 // evaluateWindow checks if a window is ready for sniping
 func (s *SniperStrategy) evaluateWindow(w *polymarket.PredictionWindow) {
 	asset := w.Asset
@@ -423,6 +423,9 @@ func (s *SniperStrategy) evaluateWindow(w *polymarket.PredictionWindow) {
 		return
 	}
 
+	// 🚀 MOMENTUM TRACKING - rocket speed detection
+	velocity, accelerating, momentumReady := s.updateMomentum(asset, currentPrice)
+	
 	// Calculate price move
 	priceMove := currentPrice.Sub(priceToBeat)
 	priceMovePct := priceMove.Div(priceToBeat).Abs()
@@ -430,12 +433,29 @@ func (s *SniperStrategy) evaluateWindow(w *polymarket.PredictionWindow) {
 	// Get per-asset min price move (BTC/ETH: 0.05%, SOL: 0.10%)
 	_, _, _, minPriceMove := s.config.GetAssetConfig(asset)
 	
-	// Check if price moved enough (per-asset threshold)
-	if priceMovePct.LessThan(minPriceMove) {
+	// 🚀 FAST ENTRY: If momentum is strong and accelerating, reduce threshold
+	// This catches last-second price spikes that travel with price-to-beat
+	effectiveMinMove := minPriceMove
+	highVelocity := velocity.Abs().GreaterThan(decimal.NewFromFloat(0.50)) // >$0.50/sec
+	
+	if momentumReady && accelerating && highVelocity && timeRemainingMin < 1.5 {
+		// Price accelerating in last 90 seconds - use 50% of threshold
+		effectiveMinMove = minPriceMove.Div(decimal.NewFromInt(2))
+		log.Debug().
+			Str("asset", asset).
+			Str("velocity", velocity.StringFixed(2)+"$/sec").
+			Bool("accelerating", accelerating).
+			Str("reduced_threshold", effectiveMinMove.Mul(decimal.NewFromInt(100)).StringFixed(3)+"%").
+			Msg("🚀 [SNIPER] MOMENTUM BOOST - reduced threshold")
+	}
+	
+	// Check if price moved enough (per-asset threshold, adjusted for momentum)
+	if priceMovePct.LessThan(effectiveMinMove) {
 		log.Debug().
 			Str("asset", asset).
 			Str("move", priceMovePct.Mul(decimal.NewFromInt(100)).StringFixed(3)+"%").
-			Str("need", minPriceMove.Mul(decimal.NewFromInt(100)).StringFixed(2)+"%").
+			Str("need", effectiveMinMove.Mul(decimal.NewFromInt(100)).StringFixed(2)+"%").
+			Str("velocity", velocity.StringFixed(2)+"$/sec").
 			Msg("🎯 [SNIPER] Price move too small")
 		return
 	}
@@ -797,7 +817,7 @@ func (s *SniperStrategy) checkPosition(pos *SniperPosition) {
 		return
 	}
 
-	// 3. HARD STOP LOSS - Only if trailing stop hasn't moved up
+	// 3. HARD STOP LOSS - Always active, protects capital
 	if currentOdds.LessThanOrEqual(pos.StopLoss) {
 		log.Warn().
 			Str("asset", pos.Asset).
@@ -810,18 +830,14 @@ func (s *SniperStrategy) checkPosition(pos *SniperPosition) {
 		return
 	}
 
-	// ═══════════════════════════════════════════════════════════════════════════════
-	// LAST 2 MINUTES: HOLD TO RESOLUTION (no stop loss!)
-	// In the final stretch, just let it ride - can't exit fast enough anyway
-	// ═══════════════════════════════════════════════════════════════════════════════
-	if time.Until(pos.WindowEnd) < 2*time.Minute {
+	// Last 30 seconds - just log, don't do anything special
+	// Stop loss still active above, but orders might not fill this close to resolution
+	if time.Until(pos.WindowEnd) < 30*time.Second {
 		log.Debug().
 			Str("asset", pos.Asset).
 			Str("current", currentOdds.Mul(decimal.NewFromInt(100)).StringFixed(0)+"¢").
 			Str("time_left", time.Until(pos.WindowEnd).String()).
-			Msg("🎯 [SNIPER] Last 2 min - HOLDING TO RESOLUTION")
-		// DO NOT EXIT - let it resolve at $1 or $0
-		return
+			Msg("🎯 [SNIPER] Final 30s - stop loss still active")
 	}
 }
 
