@@ -80,6 +80,19 @@ SignatureType    int    // 0=EOA, 1=Magic/Email, 2=Proxy
 	SniperStopLoss        decimal.Decimal // Stop loss (e.g., 0.75)
 	SniperHoldToResolution bool           // Hold to resolution instead of quick flip (default: false)
 
+	// 🐋 WHALE STRATEGY (ML-trained contrarian dip buying)
+	// Trained on 150,411 trades from top whale wallets
+	WhaleEnabled          bool            // Enable whale strategy
+	WhalePositionSizePct  decimal.Decimal // % of balance per trade (e.g., 0.15 = 15%)
+	WhaleMinOdds          decimal.Decimal // Min odds to buy (e.g., 0.15 = 15¢)
+	WhaleMaxOdds          decimal.Decimal // Max odds to buy (e.g., 0.55 = 55¢)
+	WhaleMinTimeMin       float64         // Min time remaining (minutes)
+	WhaleMaxTimeMin       float64         // Max time remaining (minutes)
+	// Per-asset optimal entry (ML-derived)
+	WhaleBTCOptimalEntry  decimal.Decimal // 35¢ - R:R 1:1.86
+	WhaleETHOptimalEntry  decimal.Decimal // 40¢ - R:R 1:1.50
+	WhaleSOLOptimalEntry  decimal.Decimal // 45¢ - R:R 1:1.22
+
 	// Triple Exit Strategy
 	ArbExitOddsThreshold decimal.Decimal // e.g., 0.75 = exit at 75¢ for quick flip
 	ArbHoldThreshold     decimal.Decimal // e.g., 0.005 = 0.5% BTC move confirms direction
@@ -157,6 +170,20 @@ SignatureType:    getEnvInt("SIGNATURE_TYPE", 0),
 		SniperBTCMinPriceMove: getEnvDecimal("SNIPER_BTC_MIN_PRICE_MOVE", decimal.NewFromFloat(0.02)), // 0.02%
 		SniperETHMinPriceMove: getEnvDecimal("SNIPER_ETH_MIN_PRICE_MOVE", decimal.NewFromFloat(0.04)), // 0.04%
 		SniperSOLMinPriceMove: getEnvDecimal("SNIPER_SOL_MIN_PRICE_MOVE", decimal.NewFromFloat(0.08)), // 0.08%
+
+		// 🐋 WHALE STRATEGY (ML-trained contrarian dip buying)
+		// Trained on 150,411 trades from top whale wallets
+		// BUY at 15-55¢ (crashed odds), HOLD to resolution, NO stop loss
+		WhaleEnabled:          getEnvBool("WHALE_ENABLED", true),  // Enable by default
+		WhalePositionSizePct:  getEnvDecimal("WHALE_POSITION_SIZE_PCT", decimal.NewFromFloat(0.15)), // 15% per trade
+		WhaleMinOdds:          getEnvDecimal("WHALE_MIN_ODDS", decimal.NewFromFloat(0.15)),  // Min 15¢
+		WhaleMaxOdds:          getEnvDecimal("WHALE_MAX_ODDS", decimal.NewFromFloat(0.55)),  // Max 55¢
+		WhaleMinTimeMin:       getEnvFloat("WHALE_MIN_TIME_MIN", 2.0),   // At least 2 min left
+		WhaleMaxTimeMin:       getEnvFloat("WHALE_MAX_TIME_MIN", 14.0),  // Can enter at start
+		// Per-asset optimal entry (ML-derived from whale data)
+		WhaleBTCOptimalEntry:  getEnvDecimal("WHALE_BTC_OPTIMAL_ENTRY", decimal.NewFromFloat(0.35)), // R:R 1:1.86
+		WhaleETHOptimalEntry:  getEnvDecimal("WHALE_ETH_OPTIMAL_ENTRY", decimal.NewFromFloat(0.40)), // R:R 1:1.50
+		WhaleSOLOptimalEntry:  getEnvDecimal("WHALE_SOL_OPTIMAL_ENTRY", decimal.NewFromFloat(0.45)), // R:R 1:1.22
 
 		// Triple Exit Strategy
 		ArbExitOddsThreshold: getEnvDecimal("ARB_EXIT_ODDS", decimal.NewFromFloat(0.75)),       // Sell at 75¢+
