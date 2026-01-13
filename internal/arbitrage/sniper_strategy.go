@@ -127,6 +127,8 @@ type SniperPosition struct {
 	Target       decimal.Decimal
 	WindowEnd    time.Time
 	PriceMovePct decimal.Decimal // Price move % at entry (to decide hold vs flip)
+	HighPrice    decimal.Decimal // Highest price seen (for trailing stop)
+	TrailingStop decimal.Decimal // Dynamic trailing stop level
 }
 
 // SniperStrategy implements the last-minute sniper trading strategy
@@ -570,7 +572,7 @@ func (s *SniperStrategy) executeSnipe(w *polymarket.PredictionWindow, side strin
 		Str("max_loss", "-$"+maxLoss.StringFixed(2)).
 		Msg("🎯 [SNIPER] EXECUTING SNIPE!")
 
-	// Create position with per-asset stop loss
+	// Create position with per-asset stop loss and trailing stop
 	pos := &SniperPosition{
 		TradeID:      fmt.Sprintf("snipe-%s-%d", asset, time.Now().UnixNano()),
 		Asset:        asset,
@@ -585,6 +587,8 @@ func (s *SniperStrategy) executeSnipe(w *polymarket.PredictionWindow, side strin
 		Target:       s.config.QuickFlipTarget,
 		WindowEnd:    w.EndDate,
 		PriceMovePct: priceMovePct, // Track price move to decide hold vs flip
+		HighPrice:    roundedPrice, // Initialize high price to entry
+		TrailingStop: assetStopLoss, // Start trailing stop at base SL
 	}
 
 	// Place the order
@@ -720,8 +724,37 @@ func (s *SniperStrategy) checkPosition(pos *SniperPosition) {
 		s.dash.UpdateMLSignal(pos.Asset, pos.Side, currentOdds, 0.9, edge.StringFixed(0)+"¢", pnl.StringFixed(2), "SNIPING")
 	}
 
-	// Check for quick flip target (95¢+)
-	// Only hold to resolution if explicitly enabled via SNIPER_HOLD_TO_RESOLUTION=true
+	// ═══════════════════════════════════════════════════════════════════════════════
+	// TRAILING STOP LOGIC: Lock in profits as price rises
+	// ═══════════════════════════════════════════════════════════════════════════════
+	
+	// Update high water mark
+	if currentOdds.GreaterThan(pos.HighPrice) {
+		pos.HighPrice = currentOdds
+		
+		// Update trailing stop: once we're 5¢+ in profit, trail 8¢ below high
+		profitFromEntry := currentOdds.Sub(pos.EntryPrice)
+		trailingDistance := decimal.NewFromFloat(0.08) // 8¢ trailing distance
+		
+		if profitFromEntry.GreaterThanOrEqual(decimal.NewFromFloat(0.05)) { // 5¢ in profit
+			newTrailingStop := pos.HighPrice.Sub(trailingDistance)
+			// Only move trailing stop UP, never down
+			if newTrailingStop.GreaterThan(pos.TrailingStop) {
+				pos.TrailingStop = newTrailingStop
+				log.Info().
+					Str("asset", pos.Asset).
+					Str("high", pos.HighPrice.Mul(decimal.NewFromInt(100)).StringFixed(0)+"¢").
+					Str("trailing_stop", pos.TrailingStop.Mul(decimal.NewFromInt(100)).StringFixed(0)+"¢").
+					Msg("📈 [SNIPER] Trailing stop raised!")
+			}
+		}
+	}
+
+	// ═══════════════════════════════════════════════════════════════════════════════
+	// EXIT CONDITIONS
+	// ═══════════════════════════════════════════════════════════════════════════════
+
+	// 1. TARGET HIT (99¢+) - Take profit
 	if currentOdds.GreaterThanOrEqual(s.config.QuickFlipTarget) {
 		if s.config.HoldToResolution {
 			// Hold to resolution enabled - check if price move is strong enough
@@ -749,8 +782,22 @@ func (s *SniperStrategy) checkPosition(pos *SniperPosition) {
 		return
 	}
 
-	// Check for stop loss - ONLY exit if at or below stop level
-	// This is the ONLY loss-exit condition. Let the price breathe above SL.
+	// 2. TRAILING STOP HIT - Lock in profit
+	if pos.TrailingStop.GreaterThan(pos.StopLoss) && currentOdds.LessThanOrEqual(pos.TrailingStop) {
+		profit := currentOdds.Sub(pos.EntryPrice).Mul(pos.Size)
+		log.Info().
+			Str("asset", pos.Asset).
+			Str("entry", pos.EntryPrice.Mul(decimal.NewFromInt(100)).StringFixed(0)+"¢").
+			Str("exit", currentOdds.Mul(decimal.NewFromInt(100)).StringFixed(0)+"¢").
+			Str("trailing_stop", pos.TrailingStop.Mul(decimal.NewFromInt(100)).StringFixed(0)+"¢").
+			Str("profit", profit.StringFixed(2)).
+			Msg("📈 [SNIPER] TRAILING STOP HIT! Locking in profit...")
+		
+		s.exitPosition(pos, currentOdds, "TRAILING_STOP")
+		return
+	}
+
+	// 3. HARD STOP LOSS - Only if trailing stop hasn't moved up
 	if currentOdds.LessThanOrEqual(pos.StopLoss) {
 		log.Warn().
 			Str("asset", pos.Asset).
@@ -763,22 +810,18 @@ func (s *SniperStrategy) checkPosition(pos *SniperPosition) {
 		return
 	}
 
-	// NO REVERSAL EXIT! Let the price breathe.
-	// Price can drop significantly above SL without triggering exit.
-	// Only the stop loss at 50¢ (or per-asset SL) triggers an exit.
-	// Example: Entry 87¢, current 72¢ (15¢ drop) → Still above 50¢ SL → HOLD!
-
-	// Check if window is about to end (last 30 seconds)
-	// In final 30s, ALWAYS hold to resolution - can't exit fast enough anyway
-	// Let the market resolve and pay out $1 or $0
-	if time.Until(pos.WindowEnd) < 30*time.Second {
-		log.Info().
+	// ═══════════════════════════════════════════════════════════════════════════════
+	// LAST 2 MINUTES: HOLD TO RESOLUTION (no stop loss!)
+	// In the final stretch, just let it ride - can't exit fast enough anyway
+	// ═══════════════════════════════════════════════════════════════════════════════
+	if time.Until(pos.WindowEnd) < 2*time.Minute {
+		log.Debug().
 			Str("asset", pos.Asset).
-			Str("side", pos.Side).
 			Str("current", currentOdds.Mul(decimal.NewFromInt(100)).StringFixed(0)+"¢").
 			Str("time_left", time.Until(pos.WindowEnd).String()).
-			Msg("🎯 [SNIPER] Last 30s - HOLDING TO RESOLUTION (no early exit)")
+			Msg("🎯 [SNIPER] Last 2 min - HOLDING TO RESOLUTION")
 		// DO NOT EXIT - let it resolve at $1 or $0
+		return
 	}
 }
 
