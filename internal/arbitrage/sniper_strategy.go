@@ -121,7 +121,7 @@ type SniperPosition struct {
 	ConditionID  string
 	WindowID     string
 	EntryPrice   decimal.Decimal
-	Size         int64 // Number of shares
+	Size         decimal.Decimal // Actual shares filled (decimal for precision)
 	EntryTime    time.Time
 	StopLoss     decimal.Decimal
 	Target       decimal.Decimal
@@ -547,14 +547,16 @@ func (s *SniperStrategy) executeSnipe(w *polymarket.PredictionWindow, side strin
 		positionUSD = decimal.NewFromFloat(10.0)
 	}
 
-	size := positionUSD.Div(roundedPrice).Floor().IntPart()
-	if size < 1 {
-		size = 1
+	// Calculate shares - keep 2 decimal places for precision
+	size := positionUSD.Div(roundedPrice).Round(2)
+	minSize := decimal.NewFromInt(5) // Polymarket minimum
+	if size.LessThan(minSize) {
+		size = minSize
 	}
 
-	actualCost := roundedPrice.Mul(decimal.NewFromInt(size))
-	potentialProfit := s.config.QuickFlipTarget.Sub(roundedPrice).Mul(decimal.NewFromInt(size))
-	maxLoss := roundedPrice.Sub(assetStopLoss).Mul(decimal.NewFromInt(size))
+	actualCost := roundedPrice.Mul(size)
+	potentialProfit := s.config.QuickFlipTarget.Sub(roundedPrice).Mul(size)
+	maxLoss := roundedPrice.Sub(assetStopLoss).Mul(size)
 
 	log.Info().
 		Str("asset", asset).
@@ -562,7 +564,7 @@ func (s *SniperStrategy) executeSnipe(w *polymarket.PredictionWindow, side strin
 		Str("entry", roundedPrice.Mul(decimal.NewFromInt(100)).StringFixed(0)+"¢").
 		Str("target", s.config.QuickFlipTarget.Mul(decimal.NewFromInt(100)).StringFixed(0)+"¢").
 		Str("stop", assetStopLoss.Mul(decimal.NewFromInt(100)).StringFixed(0)+"¢").
-		Int64("shares", size).
+		Str("shares", size.StringFixed(2)).
 		Str("cost", "$"+actualCost.StringFixed(2)).
 		Str("potential_profit", "+$"+potentialProfit.StringFixed(2)).
 		Str("max_loss", "-$"+maxLoss.StringFixed(2)).
@@ -577,7 +579,7 @@ func (s *SniperStrategy) executeSnipe(w *polymarket.PredictionWindow, side strin
 		ConditionID:  w.ConditionID,
 		WindowID:     w.ID,
 		EntryPrice:   roundedPrice,
-		Size:         size,
+		Size:         size, // Will be updated with actual filled size
 		EntryTime:    time.Now(),
 		StopLoss:     assetStopLoss, // Use per-asset stop loss
 		Target:       s.config.QuickFlipTarget,
@@ -599,7 +601,7 @@ func (s *SniperStrategy) executeSnipe(w *polymarket.PredictionWindow, side strin
 	orderID, err := s.clobClient.PlaceLimitOrder(
 		tokenID,
 		orderPrice,
-		decimal.NewFromInt(size),
+		size, // Use decimal size directly
 		"BUY",
 	)
 
@@ -611,23 +613,35 @@ func (s *SniperStrategy) executeSnipe(w *polymarket.PredictionWindow, side strin
 		return
 	}
 
+	// Query actual filled size after a brief delay
+	time.Sleep(500 * time.Millisecond)
+	_, filledSize, _, statusErr := s.clobClient.GetOrderStatus(orderID)
+	if statusErr == nil && filledSize.GreaterThan(decimal.Zero) {
+		pos.Size = filledSize // Use ACTUAL filled size
+		log.Info().
+			Str("order_id", orderID).
+			Str("filled", filledSize.StringFixed(2)).
+			Msg("🎯 [SNIPER] Actual fill recorded")
+	}
+
 	pos.TradeID = orderID
 	s.recordPosition(pos)
 
 	// Notify
 	if s.notifier != nil {
-		s.notifier.SendTradeAlert(asset, side, roundedPrice, size, "SNIPE BUY", decimal.Zero)
+		s.notifier.SendTradeAlert(asset, side, roundedPrice, pos.Size.IntPart(), "SNIPE BUY", decimal.Zero)
 	}
 
 	if s.dash != nil {
-		s.dash.AddLog(fmt.Sprintf("🎯 SNIPE: %s %s @ %s¢ x%d", asset, side, roundedPrice.Mul(decimal.NewFromInt(100)).StringFixed(0), size))
-		s.dash.UpdatePosition(asset, side, roundedPrice, roundedPrice, size, "SNIPING")
+		s.dash.AddLog(fmt.Sprintf("🎯 SNIPE: %s %s @ %s¢ x%s", asset, side, roundedPrice.Mul(decimal.NewFromInt(100)).StringFixed(0), pos.Size.StringFixed(2)))
+		s.dash.UpdatePosition(asset, side, roundedPrice, roundedPrice, pos.Size.IntPart(), "SNIPING")
 	}
 
 	log.Info().
 		Str("asset", asset).
 		Str("side", side).
 		Str("order_id", orderID).
+		Str("filled_size", pos.Size.StringFixed(2)).
 		Msg("🎯 [SNIPER] Order placed successfully!")
 }
 
@@ -698,8 +712,8 @@ func (s *SniperStrategy) checkPosition(pos *SniperPosition) {
 
 	// Update dashboard
 	if s.dash != nil {
-		pnl := currentOdds.Sub(pos.EntryPrice).Mul(decimal.NewFromInt(pos.Size))
-		s.dash.UpdatePosition(pos.Asset, pos.Side, pos.EntryPrice, currentOdds, pos.Size, "ACTIVE")
+		pnl := currentOdds.Sub(pos.EntryPrice).Mul(pos.Size)
+		s.dash.UpdatePosition(pos.Asset, pos.Side, pos.EntryPrice, currentOdds, pos.Size.IntPart(), "ACTIVE")
 		
 		// Update ML signal display with current state
 		edge := currentOdds.Sub(pos.EntryPrice).Mul(decimal.NewFromInt(100))
@@ -768,20 +782,21 @@ func (s *SniperStrategy) checkPosition(pos *SniperPosition) {
 	}
 }
 
-// exitPosition exits a position at market
+// exitPosition exits a position at market - SELLS 100% OF SHARES
 func (s *SniperStrategy) exitPosition(pos *SniperPosition, exitPrice decimal.Decimal, reason string) {
-	pnl := exitPrice.Sub(pos.EntryPrice).Mul(decimal.NewFromInt(pos.Size))
+	pnl := exitPrice.Sub(pos.EntryPrice).Mul(pos.Size)
 
 	log.Info().
 		Str("asset", pos.Asset).
 		Str("side", pos.Side).
 		Str("entry", pos.EntryPrice.Mul(decimal.NewFromInt(100)).StringFixed(0)+"¢").
 		Str("exit", exitPrice.Mul(decimal.NewFromInt(100)).StringFixed(0)+"¢").
+		Str("shares", pos.Size.StringFixed(2)).
 		Str("pnl", pnl.StringFixed(2)).
 		Str("reason", reason).
-		Msg("🎯 [SNIPER] Exiting position")
+		Msg("🎯 [SNIPER] Exiting position - SELLING ALL SHARES")
 
-	// Place sell order
+	// Place sell order for EXACT SIZE we hold
 	if s.clobClient != nil {
 		slippage := decimal.NewFromFloat(0.03) // 3¢ slippage for exit
 		sellPrice := exitPrice.Sub(slippage)
@@ -792,7 +807,7 @@ func (s *SniperStrategy) exitPosition(pos *SniperPosition, exitPrice decimal.Dec
 		_, err := s.clobClient.PlaceLimitOrder(
 			pos.TokenID,
 			sellPrice,
-			decimal.NewFromInt(pos.Size),
+			pos.Size, // SELL ALL SHARES (decimal precision)
 			"SELL",
 		)
 
@@ -827,7 +842,7 @@ func (s *SniperStrategy) exitPosition(pos *SniperPosition, exitPrice decimal.Dec
 
 	// Notify
 	if s.notifier != nil {
-		s.notifier.SendTradeAlert(pos.Asset, pos.Side, exitPrice, pos.Size, "SNIPE SELL", pnl)
+		s.notifier.SendTradeAlert(pos.Asset, pos.Side, exitPrice, pos.Size.IntPart(), "SNIPE SELL", pnl)
 	}
 }
 
@@ -835,12 +850,13 @@ func (s *SniperStrategy) exitPosition(pos *SniperPosition, exitPrice decimal.Dec
 func (s *SniperStrategy) handleResolution(pos *SniperPosition) {
 	// Position held to resolution
 	// We'll assume we won since we bet with the price direction
-	pnl := decimal.NewFromInt(1).Sub(pos.EntryPrice).Mul(decimal.NewFromInt(pos.Size))
+	pnl := decimal.NewFromInt(1).Sub(pos.EntryPrice).Mul(pos.Size)
 
 	log.Info().
 		Str("asset", pos.Asset).
 		Str("side", pos.Side).
 		Str("entry", pos.EntryPrice.Mul(decimal.NewFromInt(100)).StringFixed(0)+"¢").
+		Str("shares", pos.Size.StringFixed(2)).
 		Str("resolution", "$1.00").
 		Str("pnl", "+$"+pnl.StringFixed(2)).
 		Msg("🎯 [SNIPER] Position resolved (assuming win)")
@@ -861,7 +877,7 @@ func (s *SniperStrategy) handleResolution(pos *SniperPosition) {
 
 	// Notify
 	if s.notifier != nil {
-		s.notifier.SendTradeAlert(pos.Asset, pos.Side, decimal.NewFromInt(1), pos.Size, "SNIPE WON", pnl)
+		s.notifier.SendTradeAlert(pos.Asset, pos.Side, decimal.NewFromInt(1), pos.Size.IntPart(), "SNIPE WON", pnl)
 	}
 }
 
