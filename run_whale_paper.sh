@@ -2,8 +2,6 @@
 # Whale Strategy Paper Trading Runner
 # Run this on your VPS: ./run_whale_paper.sh
 
-cd /workspaces/polybot
-
 # Create logs directory
 mkdir -p logs
 
