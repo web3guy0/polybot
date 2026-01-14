@@ -359,6 +359,7 @@ func main() {
 				windowScanners[i],
 				clobClient,
 				db,
+				cfg.DryRun, // Paper trading mode
 			)
 			// Configure from .env
 			whaleConfig := arbitrage.WhaleConfig{

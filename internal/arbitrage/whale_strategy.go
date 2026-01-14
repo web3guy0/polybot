@@ -223,6 +223,9 @@ type WhaleStrategy struct {
 	clobClient    *CLOBClient
 	db            *database.Database
 
+	// Paper trading mode
+	paperTrade bool
+
 	// Configuration
 	config WhaleConfig
 
@@ -257,11 +260,13 @@ func NewWhaleStrategy(
 	scanner *polymarket.WindowScanner,
 	clobClient *CLOBClient,
 	db *database.Database,
+	paperTrade bool,
 ) *WhaleStrategy {
 	return &WhaleStrategy{
 		windowScanner: scanner,
 		clobClient:    clobClient,
 		db:            db,
+		paperTrade:    paperTrade,
 		config:        DefaultWhaleConfig(),
 		positions:     make(map[string]*WhalePosition),
 		priceHistory:  make(map[string]*PriceHistory),
@@ -311,6 +316,14 @@ func (ws *WhaleStrategy) scanForCrashedOdds() {
 		}
 		
 		if signal != nil && signal.Strength.GreaterThanOrEqual(decimal.NewFromFloat(50)) {
+			// Skip if already traded this window
+			ws.mu.RLock()
+			_, alreadyTraded := ws.tradedWindows[window.ID]
+			ws.mu.RUnlock()
+			if alreadyTraded {
+				continue
+			}
+			
 			// Calculate position size (15% of assumed $5 bankroll for safety)
 			positionSize := decimal.NewFromFloat(0.75) // Conservative $0.75 per trade
 			
@@ -323,14 +336,10 @@ func (ws *WhaleStrategy) scanForCrashedOdds() {
 				Str("reason", signal.Reason).
 				Msg("🐋 WHALE SIGNAL DETECTED!")
 			
-			// Execute trade if CLOB client available
-			if ws.clobClient != nil {
-				_, err := ws.ExecuteTrade(signal, positionSize)
-				if err != nil {
-					log.Error().Err(err).Msg("🐋 Failed to execute whale trade")
-				}
-			} else {
-				log.Warn().Msg("🐋 No CLOB client - would have traded")
+			// Execute trade (paper or live)
+			_, err := ws.ExecuteTrade(signal, positionSize)
+			if err != nil {
+				log.Error().Err(err).Msg("🐋 Failed to execute whale trade")
 			}
 		}
 	}
@@ -573,7 +582,13 @@ func (ws *WhaleStrategy) ExecuteTrade(signal *WhaleSignal, positionSize decimal.
 		tokenID = signal.Window.NoTokenID
 	}
 
+	modeStr := "LIVE"
+	if ws.paperTrade {
+		modeStr = "PAPER"
+	}
+
 	log.Info().
+		Str("mode", modeStr).
 		Str("asset", signal.Window.Asset).
 		Str("side", signal.Side).
 		Str("odds", signal.CurrentOdds.String()).
@@ -582,15 +597,30 @@ func (ws *WhaleStrategy) ExecuteTrade(signal *WhaleSignal, positionSize decimal.
 		Str("reason", signal.Reason).
 		Msg("🐋 WHALE ENTRY SIGNAL")
 
-	// Execute market buy
-	order, err := ws.clobClient.PlaceMarketBuy(tokenID, positionSize)
-	if err != nil {
-		return nil, fmt.Errorf("failed to place whale order: %w", err)
+	var orderID string
+
+	if ws.paperTrade {
+		// PAPER TRADE - simulate the order
+		orderID = fmt.Sprintf("paper_%s_%d", signal.Window.Asset, time.Now().UnixNano())
+		log.Info().
+			Str("asset", signal.Window.Asset).
+			Str("side", signal.Side).
+			Str("odds", signal.CurrentOdds.String()).
+			Str("size", positionSize.String()).
+			Str("order_id", orderID).
+			Msg("📝 [WHALE] Paper BUY recorded")
+	} else {
+		// LIVE TRADE - execute real order
+		order, err := ws.clobClient.PlaceMarketBuy(tokenID, positionSize)
+		if err != nil {
+			return nil, fmt.Errorf("failed to place whale order: %w", err)
+		}
+		orderID = order.OrderID
 	}
 
 	// Create position
 	position := &WhalePosition{
-		TradeID:     order.OrderID,
+		TradeID:     orderID,
 		Asset:       signal.Window.Asset,
 		Side:        signal.Side,
 		TokenID:     tokenID,
@@ -620,7 +650,7 @@ func (ws *WhaleStrategy) ExecuteTrade(signal *WhaleSignal, positionSize decimal.
 	}
 
 	log.Info().
-		Str("trade_id", order.OrderID).
+		Str("trade_id", orderID).
 		Str("asset", signal.Window.Asset).
 		Str("side", signal.Side).
 		Str("entry", fmt.Sprintf("%.0f¢", signal.CurrentOdds.Mul(decimal.NewFromInt(100)).InexactFloat64())).
