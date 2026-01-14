@@ -470,15 +470,16 @@ func (ws *WhaleStrategy) executeExit(position *WhalePosition, exitPrice decimal.
 		// PAPER TRADE - just log
 		log.Info().
 			Str("asset", position.Asset).
-			Str("size", position.Size.String()).
+			Str("shares", position.Size.String()).
 			Str("pnl", fmt.Sprintf("%+$%.4f", pnl.InexactFloat64())).
 			Msg("📝 [WHALE] Paper SELL recorded")
 	} else {
-		// LIVE TRADE - execute sell order
-		_, err := ws.clobClient.PlaceMarketSell(position.TokenID, position.Size)
+		// LIVE TRADE - execute sell order with actual shares (not dollars)
+		_, err := ws.clobClient.SellSharesAtPrice(position.TokenID, position.Size, exitPrice)
 		if err != nil {
 			log.Error().Err(err).
 				Str("asset", position.Asset).
+				Str("shares", position.Size.String()).
 				Msg("🐋❌ Failed to execute exit order")
 			return // Don't update position if sell failed
 		}

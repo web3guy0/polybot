@@ -409,6 +409,51 @@ func (c *CLOBClient) PlaceMarketSellAtPrice(tokenID string, size decimal.Decimal
 	return c.placeOrder(tokenID, SideSell, size, marketPrice)
 }
 
+// SellSharesAtPrice sells a specific number of shares at a given price
+// Unlike PlaceMarketSell, this does NOT convert dollars to shares - it uses shares directly
+func (c *CLOBClient) SellSharesAtPrice(tokenID string, shares decimal.Decimal, exitPrice decimal.Decimal) (*OrderResponse, error) {
+	start := time.Now()
+
+	// For sells, we want to sell AT or BELOW the current price for fast fill
+	// Subtract slippage to ensure we get filled
+	slippage := decimal.NewFromFloat(0.03)
+	price := exitPrice.Sub(slippage)
+	if price.LessThan(decimal.NewFromFloat(0.01)) {
+		price = decimal.NewFromFloat(0.01)
+	}
+
+	// Ensure minimum 5 shares
+	if shares.LessThan(decimal.NewFromInt(5)) {
+		shares = decimal.NewFromInt(5)
+	}
+
+	// Round shares to avoid dust
+	shares = shares.Round(2)
+
+	// Create order signer
+	signer := NewOrderSigner(c.privateKey, c.address, c.funderAddress, c.signatureType)
+
+	// Create and sign order with actual share count
+	signedOrder, err := signer.CreateSignedOrder(tokenID, SideSell, price, shares)
+	if err != nil {
+		return nil, fmt.Errorf("failed to sign sell order: %w", err)
+	}
+
+	signTime := time.Since(start)
+
+	log.Info().
+		Str("token", tokenID[:20]+"...").
+		Str("side", "SELL").
+		Str("shares", shares.String()).
+		Str("price", price.String()).
+		Str("exit_price", exitPrice.String()).
+		Dur("sign_time_ms", signTime).
+		Msg("⚡ SELL order signed (shares)")
+
+	// Submit order to CLOB
+	return c.submitSignedOrder(signedOrder)
+}
+
 // placeOrder places an order using native Go EIP-712 signing (fast!)
 // If marketPrice is provided (non-zero), skip the odds fetch for speed
 // NOTE: size is in DOLLARS for market orders, will be converted to shares
