@@ -422,12 +422,13 @@ func (c *CLOBClient) SellSharesAtPrice(tokenID string, shares decimal.Decimal, e
 		price = decimal.NewFromFloat(0.01)
 	}
 
-	// Ensure minimum 5 shares
-	if shares.LessThan(decimal.NewFromInt(5)) {
-		shares = decimal.NewFromInt(5)
+	// For SELLS: sell what we own, no minimum (unlike buys which need 5 min)
+	// Just ensure at least some shares to sell
+	if shares.LessThanOrEqual(decimal.Zero) {
+		return nil, fmt.Errorf("cannot sell 0 or negative shares")
 	}
 
-	// Round shares to avoid dust
+	// Round shares to 2 decimal places
 	shares = shares.Round(2)
 
 	// Create order signer
