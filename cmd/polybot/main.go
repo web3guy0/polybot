@@ -359,7 +359,8 @@ func main() {
 				windowScanners[i],
 				clobClient,
 				db,
-				cfg.DryRun, // Paper trading mode
+				cfg.DryRun,   // Paper trading mode
+				cfg.Bankroll, // Bankroll for position sizing
 			)
 			// Configure from .env
 			whaleConfig := arbitrage.WhaleConfig{

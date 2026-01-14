@@ -225,6 +225,9 @@ type WhaleStrategy struct {
 
 	// Paper trading mode
 	paperTrade bool
+	
+	// Bankroll for position sizing
+	bankroll decimal.Decimal
 
 	// Configuration
 	config WhaleConfig
@@ -261,12 +264,14 @@ func NewWhaleStrategy(
 	clobClient *CLOBClient,
 	db *database.Database,
 	paperTrade bool,
+	bankroll decimal.Decimal,
 ) *WhaleStrategy {
 	return &WhaleStrategy{
 		windowScanner: scanner,
 		clobClient:    clobClient,
 		db:            db,
 		paperTrade:    paperTrade,
+		bankroll:      bankroll,
 		config:        DefaultWhaleConfig(),
 		positions:     make(map[string]*WhalePosition),
 		priceHistory:  make(map[string]*PriceHistory),
@@ -324,8 +329,13 @@ func (ws *WhaleStrategy) scanForCrashedOdds() {
 				continue
 			}
 			
-			// Calculate position size (15% of assumed $5 bankroll for safety)
-			positionSize := decimal.NewFromFloat(0.75) // Conservative $0.75 per trade
+			// Calculate position size: bankroll × position_size_pct
+			// Polymarket minimum for market orders is $1
+			positionSize := ws.bankroll.Mul(ws.config.PositionSizePct)
+			minMarketOrder := decimal.NewFromFloat(1.0) // $1 minimum for market orders
+			if positionSize.LessThan(minMarketOrder) {
+				positionSize = minMarketOrder
+			}
 			
 			log.Info().
 				Str("asset", window.Asset).
