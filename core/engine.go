@@ -328,3 +328,28 @@ func (e *Engine) GetStats() (trades, wins, losses int, pnl, equity decimal.Decim
 	defer e.mu.RUnlock()
 	return e.totalTrades, e.winCount, e.lossCount, e.totalPnL, e.equity
 }
+
+// ProcessSignal handles a signal from external sources (like SniperV3's RunLoop)
+func (e *Engine) ProcessSignal(signal *strategy.Signal, strategyName string) {
+	if signal == nil {
+		return
+	}
+
+	// Validate signal with risk manager
+	if !e.riskMgr.ValidateSignal(signal, e.equity, e.positions) {
+		log.Debug().
+			Str("strategy", strategyName).
+			Str("reason", "risk rejected").
+			Msg("Signal rejected")
+		return
+	}
+
+	// Calculate position size
+	size := e.riskMgr.CalculateSize(signal, e.equity)
+	if size.LessThanOrEqual(decimal.Zero) {
+		return
+	}
+
+	// Execute trade
+	e.executeSignal(signal, size, strategyName)
+}
