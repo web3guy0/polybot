@@ -197,3 +197,40 @@ func (f *BinanceFeed) broadcast(update PriceUpdate) {
 		}
 	}
 }
+
+// GetHistoricalPrice gets the price at a specific timestamp using klines API
+// Returns the close price of the 1-minute candle that contains the timestamp
+func (f *BinanceFeed) GetHistoricalPrice(symbol string, timestamp int64) (decimal.Decimal, error) {
+	// Binance klines: GET /api/v3/klines?symbol=BTCUSDT&interval=1m&startTime=xxx&limit=1
+	url := fmt.Sprintf("https://api.binance.com/api/v3/klines?symbol=%sUSDT&interval=1m&startTime=%d&limit=1",
+		symbol, timestamp*1000) // Binance uses milliseconds
+
+	resp, err := http.Get(url)
+	if err != nil {
+		return decimal.Zero, err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return decimal.Zero, err
+	}
+
+	// Response is array of arrays: [[openTime, open, high, low, close, volume, ...]]
+	var klines [][]interface{}
+	if err := json.Unmarshal(body, &klines); err != nil {
+		return decimal.Zero, err
+	}
+
+	if len(klines) == 0 || len(klines[0]) < 5 {
+		return decimal.Zero, fmt.Errorf("no kline data for %s at %d", symbol, timestamp)
+	}
+
+	// Index 1 is the OPEN price of that candle (closest to exact timestamp)
+	openPriceStr, ok := klines[0][1].(string)
+	if !ok {
+		return decimal.Zero, fmt.Errorf("invalid price format")
+	}
+
+	return decimal.NewFromString(openPriceStr)
+}

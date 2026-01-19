@@ -1,6 +1,8 @@
 package core
 
 import (
+	"os"
+	"strconv"
 	"sync"
 	"time"
 
@@ -30,6 +32,11 @@ type RiskValidator interface {
 	RecordTrade(pnl decimal.Decimal)
 }
 
+// TradeNotifier interface for trade notifications (Telegram)
+type TradeNotifier interface {
+	NotifyTrade(action, asset, side string, price, size decimal.Decimal)
+}
+
 type Engine struct {
 	mu sync.RWMutex
 
@@ -52,6 +59,9 @@ type Engine struct {
 	winCount    int
 	lossCount   int
 	totalPnL    decimal.Decimal
+
+	// Notifications
+	tradeNotifier TradeNotifier
 }
 
 // NewEngine creates a new trading engine
@@ -219,11 +229,24 @@ func (e *Engine) executeSignal(signal *strategy.Signal, size decimal.Decimal, st
 	if e.db != nil {
 		e.db.LogTrade(pos.ID, pos.Asset, pos.Side, pos.EntryPrice, pos.Size, "OPEN", strategyName)
 	}
+
+	// Notify via Telegram
+	if e.tradeNotifier != nil {
+		e.tradeNotifier.NotifyTrade("OPEN", signal.Asset, signal.Side, signal.Entry, size)
+	}
 }
 
 // positionMonitorLoop monitors open positions for TP/SL
 func (e *Engine) positionMonitorLoop() {
-	ticker := time.NewTicker(200 * time.Millisecond)
+	// Use POSITION_MONITOR_MS from env, default 300ms
+	intervalMs := 300
+	if v := os.Getenv("POSITION_MONITOR_MS"); v != "" {
+		if i, err := strconv.Atoi(v); err == nil && i > 0 {
+			intervalMs = i
+		}
+	}
+	
+	ticker := time.NewTicker(time.Duration(intervalMs) * time.Millisecond)
 	defer ticker.Stop()
 
 	for {
@@ -320,6 +343,11 @@ func (e *Engine) exitPosition(pos *types.Position, exitPrice decimal.Decimal, re
 
 	// Notify risk manager
 	e.riskMgr.RecordTrade(pnl)
+
+	// Notify via Telegram
+	if e.tradeNotifier != nil {
+		e.tradeNotifier.NotifyTrade(reason, pos.Asset, pos.Side, exitPrice, pos.Size)
+	}
 }
 
 // GetStats returns current engine statistics
@@ -400,6 +428,11 @@ func (e *Engine) ProcessSignal(signal *strategy.Signal, strategyName string) {
 // ═══════════════════════════════════════════════════════════════════════════════
 // TELEGRAM BOT INTERFACE
 // ═══════════════════════════════════════════════════════════════════════════════
+
+// SetTradeNotifier sets the callback for trade notifications
+func (e *Engine) SetTradeNotifier(notifier TradeNotifier) {
+	e.tradeNotifier = notifier
+}
 
 // GetBalance returns current USDC balance from exchange
 func (e *Engine) GetBalance() (decimal.Decimal, error) {

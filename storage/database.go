@@ -357,6 +357,26 @@ func (d *Database) GetRecentSnapshots(limit int) ([]WindowSnapshot, error) {
 	return snapshots, nil
 }
 
+// GetWindowStartPrice retrieves the stored start price for a market
+func (d *Database) GetWindowStartPrice(marketID string) (decimal.Decimal, bool) {
+	if !d.enabled {
+		return decimal.Zero, false
+	}
+
+	var startPrice decimal.Decimal
+	err := d.db.QueryRow(`
+		SELECT binance_start_price FROM window_snapshots 
+		WHERE market_id = $1 
+		ORDER BY created_at DESC LIMIT 1
+	`, marketID).Scan(&startPrice)
+
+	if err != nil {
+		return decimal.Zero, false
+	}
+
+	return startPrice, true
+}
+
 // Close closes the database connection
 func (d *Database) Close() {
 	if d.db != nil {

@@ -75,6 +75,8 @@ func main() {
 	if db != nil {
 		windowScanner.SetDatabase(db) // Save snapshots to DB
 	}
+	windowScanner.SetBinanceFeed(binanceFeed) // For historical price lookups
+	windowScanner.SetPolyFeed(polyFeed)       // For live odds updates
 	windowScanner.Start()
 	log.Info().Msg("✅ Window scanner initialized")
 
@@ -105,6 +107,7 @@ func main() {
 	} else {
 		tgBot = tg
 		tgBot.Start()
+		engine.SetTradeNotifier(tgBot) // Wire up trade notifications
 		log.Info().Msg("✅ Telegram initialized")
 	}
 
@@ -116,6 +119,27 @@ func main() {
 	if os.Getenv("DRY_RUN") == "true" {
 		mode = "PAPER"
 	}
+	
+	minTime := os.Getenv("MIN_TIME_SEC")
+	if minTime == "" {
+		minTime = "15"
+	}
+	maxTime := os.Getenv("MAX_TIME_SEC")
+	if maxTime == "" {
+		maxTime = "60"
+	}
+	minOdds := os.Getenv("MIN_ODDS")
+	if minOdds == "" {
+		minOdds = "0.88"
+	}
+	maxOdds := os.Getenv("MAX_ODDS")
+	if maxOdds == "" {
+		maxOdds = "0.93"
+	}
+	scanMs := os.Getenv("SCAN_INTERVAL_MS")
+	if scanMs == "" {
+		scanMs = "100"
+	}
 
 	log.Info().Msg("")
 	log.Info().Msg("╔═══════════════════════════════════════╗")
@@ -123,10 +147,10 @@ func main() {
 	log.Info().Msg("╠═══════════════════════════════════════╣")
 	log.Info().Msgf("║  Mode:    %-27s ║", mode)
 	log.Info().Msg("║  Assets:  BTC, ETH, SOL               ║")
-	log.Info().Msg("║  Scan:    100ms                       ║")
-	log.Info().Msg("║  Entry:   88-93¢                      ║")
+	log.Info().Msgf("║  Scan:    %-27s ║", scanMs+"ms")
+	log.Info().Msgf("║  Entry:   %-27s ║", minOdds[2:]+"¢-"+maxOdds[2:]+"¢")
 	log.Info().Msg("║  TP/SL:   99¢ / 70¢                   ║")
-	log.Info().Msg("║  Window:  15-60 sec                   ║")
+	log.Info().Msgf("║  Window:  %-27s ║", minTime+"-"+maxTime+" sec")
 	log.Info().Msg("╚═══════════════════════════════════════╝")
 	log.Info().Msg("")
 

@@ -150,16 +150,22 @@ if last, ok := s.lastSignal[w.ID]; ok && time.Since(last) < s.cooldown {
 return nil
 }
 
-// Get Chainlink-aligned price
+// Get Chainlink-aligned price (current)
 price := s.priceFeed.GetPrice(w.Asset)
-if price.IsZero() || w.PriceToBeat.IsZero() {
+if price.IsZero() {
+return nil
+}
+
+// Price to beat is captured at window start from Chainlink
+// This is what we compare against to determine Up/Down
+if w.PriceToBeat.IsZero() {
 return nil
 }
 
 // Track for momentum
 s.trackPrice(w.Asset, price)
 
-// Calculate move %
+// Calculate move % from price to beat
 move := price.Sub(w.PriceToBeat).Div(w.PriceToBeat).Mul(decimal.NewFromInt(100))
 absMove := move.Abs()
 minMove := s.getMinMove(w.Asset)
