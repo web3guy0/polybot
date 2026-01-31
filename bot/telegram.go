@@ -354,11 +354,11 @@ func (b *TelegramBot) handleCommand(msg *tgbotapi.Message) {
 }
 
 func (b *TelegramBot) cmdHelp() {
-	msg := `🤖 *POLYBOT COMMANDS*
+	msg := `🤖 *POLYBOT v8.0 PRO COMMANDS*
 ━━━━━━━━━━━━━━━━━━━━
 
 📊 /status — Bot status
-� /balance — Account balance
+💰 /balance — Account balance
 📈 /stats — Trading statistics
 📜 /trades — Last 10 trades
 💼 /positions — Open positions
@@ -367,14 +367,16 @@ func (b *TelegramBot) cmdHelp() {
 🏓 /ping — Test connection
 
 ━━━━━━━━━━━━━━━━━━━━
-Polybot Sniper — 100ms detection`
+Phase Scalper — 50ms detection
+Fade overreactions in 15-min windows`
 
 	b.sendMarkdown(msg)
 }
 
 func (b *TelegramBot) cmdStatus() {
+	// Check both PAPER_MODE and DRY_RUN for mode determination
 	mode := "LIVE"
-	if os.Getenv("DRY_RUN") == "true" {
+	if os.Getenv("PAPER_MODE") == "true" || os.Getenv("DRY_RUN") == "true" {
 		mode = "PAPER"
 	}
 
@@ -394,10 +396,12 @@ func (b *TelegramBot) cmdStatus() {
 %s
 📊 Mode: *%s*
 💰 Balance: *%s*
-🎯 Strategy: *Sniper*
-⏱️ Detection: *100ms*
+🎯 Strategy: *Phase Scalper*
+⏱️ Detection: *50ms*
 
-Entry: 88-93¢ | TP: 99¢ | SL: 70¢`, status, mode, balanceStr)
+Phases: OPENING/CLOSING only
+Entry: Fade ≥4-6¢ moves
+TP: +2.5¢ | Timeout: 15s`, status, mode, balanceStr)
 
 	b.sendMarkdown(msg)
 }

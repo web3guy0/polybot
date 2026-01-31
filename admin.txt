@@ -1,0 +1,43 @@
+.
+├── README.md
+├── admin.txt
+├── bot
+│   └── telegram.go
+├── cmd
+│   └── main.go
+├── core
+│   ├── engine.go
+│   ├── router.go
+│   └── symbols.go
+├── data
+│   └── polybot.db
+├── exec
+│   └── client.go
+├── execution
+│   ├── adapter.go
+│   ├── executor.go
+│   └── reconciler.go
+├── feeds
+│   ├── binance.go
+│   ├── chainlink.go
+│   ├── orderbook.go
+│   ├── polymarket_ws.go
+│   └── window_scanner.go
+├── go.mod
+├── go.sum
+├── polybot
+├── risk
+│   ├── adapter.go
+│   ├── gate.go
+│   ├── manager.go
+│   ├── sizing.go
+│   └── tp_sl.go
+├── storage
+│   └── database.go
+├── strategy
+│   ├── interface.go
+│   └── phase_scalper.go
+└── types
+    └── types.go
+
+12 directories, 29 files

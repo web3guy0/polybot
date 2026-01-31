@@ -94,11 +94,22 @@ func (f *BinanceFeed) Subscribe() chan PriceUpdate {
 	return ch
 }
 
-// GetPrice returns the current price for a symbol
+// GetPrice returns the current price for a symbol (supports both "BTC" and "BTCUSDT")
 func (f *BinanceFeed) GetPrice(symbol string) decimal.Decimal {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
-	return f.prices[symbol]
+	
+	// Try direct lookup first
+	if price, ok := f.prices[symbol]; ok {
+		return price
+	}
+	
+	// Try with USDT suffix
+	if price, ok := f.prices[symbol+"USDT"]; ok {
+		return price
+	}
+	
+	return decimal.Zero
 }
 
 // GetPrices returns all current prices

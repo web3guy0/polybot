@@ -123,10 +123,33 @@ func (d *Database) migrate() error {
 		UNIQUE(market_id, created_at)
 	);
 
+	CREATE TABLE IF NOT EXISTS execution_positions (
+		id TEXT PRIMARY KEY,
+		market_id TEXT NOT NULL,
+		token_id TEXT NOT NULL,
+		asset TEXT NOT NULL,
+		side TEXT NOT NULL,
+		size NUMERIC(18,8) NOT NULL,
+		avg_entry NUMERIC(18,8) NOT NULL,
+		strategy TEXT NOT NULL,
+		opened_at TIMESTAMP DEFAULT NOW(),
+		metadata TEXT DEFAULT '{}'
+	);
+
+	CREATE TABLE IF NOT EXISTS risk_state (
+		date DATE PRIMARY KEY,
+		balance NUMERIC(18,8) NOT NULL,
+		daily_pnl NUMERIC(18,8) DEFAULT 0,
+		consecutive_losses INT DEFAULT 0,
+		circuit_tripped BOOLEAN DEFAULT FALSE,
+		disabled_assets TEXT DEFAULT '[]'
+	);
+
 	CREATE INDEX IF NOT EXISTS idx_trades_created ON trades(created_at);
 	CREATE INDEX IF NOT EXISTS idx_positions_status ON positions(status);
 	CREATE INDEX IF NOT EXISTS idx_snapshots_market ON window_snapshots(market_id);
 	CREATE INDEX IF NOT EXISTS idx_snapshots_created ON window_snapshots(created_at);
+	CREATE INDEX IF NOT EXISTS idx_exec_positions_asset ON execution_positions(asset);
 	`
 
 	_, err := d.db.Exec(schema)
@@ -387,4 +410,136 @@ func (d *Database) Close() {
 // IsEnabled returns if database is enabled
 func (d *Database) IsEnabled() bool {
 	return d.enabled
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// EXECUTION POSITIONS - Persist active positions for crash recovery
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ExecutionPosition represents a persisted position for the execution layer
+type ExecutionPosition struct {
+	ID         string
+	MarketID   string
+	TokenID    string
+	Asset      string
+	Side       string
+	Size       decimal.Decimal
+	AvgEntry   decimal.Decimal
+	Strategy   string
+	OpenedAt   time.Time
+	Metadata   string // JSON metadata
+}
+
+// SaveExecutionPosition persists an open position
+func (d *Database) SaveExecutionPosition(pos *ExecutionPosition) error {
+	if !d.enabled {
+		return nil
+	}
+
+	_, err := d.db.Exec(`
+		INSERT INTO execution_positions (id, market_id, token_id, asset, side, size, avg_entry, strategy, opened_at, metadata)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+		ON CONFLICT (id) DO UPDATE SET
+			size = $6,
+			avg_entry = $7,
+			metadata = $10
+	`, pos.ID, pos.MarketID, pos.TokenID, pos.Asset, pos.Side, pos.Size, pos.AvgEntry, pos.Strategy, pos.OpenedAt, pos.Metadata)
+
+	if err != nil {
+		log.Error().Err(err).Str("id", pos.ID).Msg("Failed to save execution position")
+	}
+
+	return err
+}
+
+// DeleteExecutionPosition removes a closed position
+func (d *Database) DeleteExecutionPosition(id string) error {
+	if !d.enabled {
+		return nil
+	}
+
+	_, err := d.db.Exec(`DELETE FROM execution_positions WHERE id = $1`, id)
+	return err
+}
+
+// GetAllExecutionPositions retrieves all open positions for recovery
+func (d *Database) GetAllExecutionPositions() ([]*ExecutionPosition, error) {
+	if !d.enabled {
+		return nil, nil
+	}
+
+	rows, err := d.db.Query(`
+		SELECT id, market_id, token_id, asset, side, size, avg_entry, strategy, opened_at, COALESCE(metadata, '{}')
+		FROM execution_positions
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var positions []*ExecutionPosition
+	for rows.Next() {
+		pos := &ExecutionPosition{}
+		err := rows.Scan(&pos.ID, &pos.MarketID, &pos.TokenID, &pos.Asset, &pos.Side, &pos.Size, &pos.AvgEntry, &pos.Strategy, &pos.OpenedAt, &pos.Metadata)
+		if err != nil {
+			log.Warn().Err(err).Msg("Failed to scan execution position")
+			continue
+		}
+		positions = append(positions, pos)
+	}
+
+	return positions, nil
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// RISK STATE - Persist risk gate state for crash recovery
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// RiskState represents persisted risk state
+type RiskState struct {
+	Date              string
+	Balance           decimal.Decimal
+	DailyPnL          decimal.Decimal
+	ConsecutiveLosses int
+	CircuitTripped    bool
+	DisabledAssets    string // JSON array
+}
+
+// SaveRiskState persists the current risk state
+func (d *Database) SaveRiskState(state *RiskState) error {
+	if !d.enabled {
+		return nil
+	}
+
+	_, err := d.db.Exec(`
+		INSERT INTO risk_state (date, balance, daily_pnl, consecutive_losses, circuit_tripped, disabled_assets)
+		VALUES ($1, $2, $3, $4, $5, $6)
+		ON CONFLICT (date) DO UPDATE SET
+			balance = $2,
+			daily_pnl = $3,
+			consecutive_losses = $4,
+			circuit_tripped = $5,
+			disabled_assets = $6
+	`, state.Date, state.Balance, state.DailyPnL, state.ConsecutiveLosses, state.CircuitTripped, state.DisabledAssets)
+
+	return err
+}
+
+// GetRiskState retrieves the latest risk state
+func (d *Database) GetRiskState(date string) (*RiskState, error) {
+	if !d.enabled {
+		return nil, nil
+	}
+
+	state := &RiskState{}
+	err := d.db.QueryRow(`
+		SELECT date, balance, daily_pnl, consecutive_losses, circuit_tripped, COALESCE(disabled_assets, '[]')
+		FROM risk_state WHERE date = $1
+	`, date).Scan(&state.Date, &state.Balance, &state.DailyPnL, &state.ConsecutiveLosses, &state.CircuitTripped, &state.DisabledAssets)
+
+	if err != nil {
+		return nil, err
+	}
+
+	return state, nil
 }
