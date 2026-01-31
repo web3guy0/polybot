@@ -280,17 +280,18 @@ func (b *TelegramBot) NotifyStartup(mode string) {
 		}
 	}
 
-	msg := fmt.Sprintf(`🚀 *POLYBOT STARTED*
+	msg := fmt.Sprintf(`🚀 *POLYBOT v8.0 PRO STARTED*
 ━━━━━━━━━━━━━━━━━━━━
 
-🎯 Strategy: *Sniper*
+🎯 Strategy: *Phase Scalper*
 📊 Mode: *%s*
 💰 Balance: *%s*
-⏱️ Detection: *100ms*
+⏱️ Scan: *50ms*
 
 ━━━━━━━━━━━━━━━━━━━━
-Entry: 88-93¢ | TP: 99¢ | SL: 70¢
-Window: Last 15-60 seconds
+📈 Opening: Fade ≥6¢ moves
+📉 Closing: Fade ≥4¢ moves
+🎯 TP: +2.5¢ | ⏱️ Timeout: 15s
 
 Use /help for commands`, mode, balanceStr)
 
